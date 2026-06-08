@@ -63,6 +63,8 @@
 //! [`run_simple`] (no turbofish, no empty args struct) instead of [`run`].
 
 pub mod args;
+#[cfg(feature = "auth")]
+pub mod auth;
 pub mod config;
 pub mod error;
 mod runner;
@@ -71,7 +73,9 @@ pub mod service;
 pub mod transport;
 
 pub use args::CommonServeArgs;
-pub use config::{DEFAULT_MAX_CONTENT_LENGTH, EnabledTransports, ServerConfig, TransportKind};
+pub use config::{
+    DEFAULT_MAX_CONTENT_LENGTH, EnabledTransports, ServerConfig, TransportKind, WsAuth,
+};
 pub use error::{Error, Result, TransportError, code};
 pub use server::{Dispatch, ServerCore, Session};
 pub use service::{CallError, Content, McpService, ToolDef, ToolReply};

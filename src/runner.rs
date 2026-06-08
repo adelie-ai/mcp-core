@@ -131,25 +131,80 @@ pub async fn serve_unix(core: Arc<ServerCore>, path: &str) -> Result<()> {
     }
 }
 
+/// Shared state for the websocket router: the core, plus (with the `auth`
+/// feature) the authenticator checked on every connection.
+#[cfg(feature = "websocket")]
+#[derive(Clone)]
+struct WsState {
+    core: Arc<ServerCore>,
+    #[cfg(feature = "auth")]
+    auth: Arc<crate::auth::Authenticator>,
+}
+
 /// Serve over websocket at `ws://host:port/ws`, one [`Session`] per connection.
+/// When the server's [`crate::config::WsAuth`] is not `None`, each connection's
+/// `Authorization: Bearer <jwt>` header is validated before the upgrade (this
+/// requires the `auth` feature).
 #[cfg(feature = "websocket")]
 pub async fn serve_websocket(core: Arc<ServerCore>, host: &str, port: u16) -> Result<()> {
     use axum::Router;
-    use axum::extract::{State, ws::WebSocketUpgrade};
-    use axum::response::Response;
     use axum::routing::get;
     use tokio::net::TcpListener;
 
-    async fn ws_handler(ws: WebSocketUpgrade, State(core): State<Arc<ServerCore>>) -> Response {
-        ws.on_upgrade(move |socket| ws_connection(socket, core))
+    #[cfg(not(feature = "auth"))]
+    if !matches!(core.config().ws_auth, crate::config::WsAuth::None) {
+        return Err(Error::Config(
+            "websocket_auth is configured but mcp-core was built without the `auth` feature".into(),
+        ));
     }
 
-    let app = Router::new().route("/ws", get(ws_handler)).with_state(core);
+    #[cfg(feature = "auth")]
+    let state = {
+        let auth = Arc::new(crate::auth::Authenticator::from(core.config().ws_auth.clone()).await?);
+        if auth.is_enabled() {
+            eprintln!("mcp-core: websocket Bearer-token authentication enabled");
+        }
+        WsState {
+            core: Arc::clone(&core),
+            auth,
+        }
+    };
+    #[cfg(not(feature = "auth"))]
+    let state = WsState {
+        core: Arc::clone(&core),
+    };
+
+    let app = Router::new()
+        .route("/ws", get(ws_handler))
+        .with_state(state);
     let addr = format!("{host}:{port}");
     let listener = TcpListener::bind(&addr).await?;
     eprintln!("mcp-core: websocket listening on ws://{addr}/ws");
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+#[cfg(all(feature = "websocket", feature = "auth"))]
+async fn ws_handler(
+    axum::extract::State(state): axum::extract::State<WsState>,
+    headers: axum::http::HeaderMap,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if let Err(e) = state.auth.check(&headers).await {
+        return (axum::http::StatusCode::UNAUTHORIZED, e.to_string()).into_response();
+    }
+    let core = Arc::clone(&state.core);
+    ws.on_upgrade(move |socket| ws_connection(socket, core))
+}
+
+#[cfg(all(feature = "websocket", not(feature = "auth")))]
+async fn ws_handler(
+    axum::extract::State(state): axum::extract::State<WsState>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> axum::response::Response {
+    let core = Arc::clone(&state.core);
+    ws.on_upgrade(move |socket| ws_connection(socket, core))
 }
 
 #[cfg(feature = "websocket")]

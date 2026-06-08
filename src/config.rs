@@ -58,6 +58,23 @@ impl EnabledTransports {
     }
 }
 
+/// WebSocket authentication strategy. Validated before the upgrade. Anything
+/// other than [`WsAuth::None`] requires mcp-core to be built with the `auth`
+/// feature; it is ignored by the stdio/unix transports (local = trusted).
+#[derive(Clone, Debug, Default)]
+pub enum WsAuth {
+    /// No authentication (default) — anyone who can reach the socket.
+    #[default]
+    None,
+    /// Validate a Bearer JWT signed with this HMAC shared secret (HS256).
+    Secret(String),
+    /// Validate a Bearer JWT against the JWKS document at this URL.
+    Jwks(String),
+    /// Validate a Bearer JWT via OIDC discovery from this issuer URL (fetches
+    /// `<issuer>/.well-known/openid-configuration` to find the JWKS).
+    OidcIssuer(String),
+}
+
 /// MCP protocol versions this core knows how to negotiate, newest last.
 pub const DEFAULT_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
 
@@ -86,6 +103,9 @@ pub struct ServerConfig {
     pub tools_list_changed: bool,
     /// Upper bound on a single framed message, in bytes.
     pub max_content_length: usize,
+    /// WebSocket authentication strategy (default [`WsAuth::None`]). Requires
+    /// the `auth` feature when not `None`.
+    pub ws_auth: WsAuth,
 }
 
 impl ServerConfig {
@@ -104,6 +124,7 @@ impl ServerConfig {
                 .collect(),
             tools_list_changed: false,
             max_content_length: DEFAULT_MAX_CONTENT_LENGTH,
+            ws_auth: WsAuth::None,
         }
     }
 
@@ -144,6 +165,13 @@ impl ServerConfig {
     /// Override the maximum accepted framed-message size.
     pub fn max_content_length(mut self, bytes: usize) -> Self {
         self.max_content_length = bytes;
+        self
+    }
+
+    /// Require Bearer-token authentication on the websocket transport. Needs the
+    /// `auth` feature; the stdio/unix transports ignore it.
+    pub fn websocket_auth(mut self, auth: WsAuth) -> Self {
+        self.ws_auth = auth;
         self
     }
 
