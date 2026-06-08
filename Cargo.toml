@@ -26,9 +26,10 @@ axum = { version = "0.8", features = ["ws"], optional = true }
 futures-util = { version = "0.3", optional = true }
 
 [features]
-default = ["websocket"]
-# Pulls in axum for the WebSocket transport. A server that only ever speaks
-# stdio/unix can `default-features = false` to avoid the axum dependency.
+# Stdio + unix are free (no extra crates), so they're on by default. The
+# websocket transport pulls in axum, so it is strictly opt-in — most MCP servers
+# only ever speak stdio. Enable it per-server with `features = ["websocket"]`.
+default = ["unix"]
 websocket = ["dep:axum", "dep:futures-util"]
 # Unix-domain-socket transport. Uses tokio's net (already a dependency), so this
 # feature only gates the code, not extra crates.

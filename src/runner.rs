@@ -237,3 +237,34 @@ where
     let core = ServerCore::new(config, Arc::new(service));
     serve(core, &common).await
 }
+
+/// Like [`run`], but for servers with no extra CLI flags — the common case.
+/// Avoids the turbofish and the empty `clap::Args` boilerplate:
+///
+/// ```no_run
+/// # use mcp_core::{ServerConfig, McpService, ToolDef, ToolReply, CallError};
+/// # use serde_json::Value;
+/// # struct Svc;
+/// # #[mcp_core::async_trait] impl McpService for Svc {
+/// #   fn tools(&self) -> Vec<ToolDef> { vec![] }
+/// #   async fn call_tool(&self, _: &str, _: &Value) -> Result<ToolReply, CallError> { Ok(ToolReply::text("")) }
+/// # }
+/// # async fn run() -> mcp_core::Result<()> {
+/// let config = ServerConfig::new("demo-mcp", env!("CARGO_PKG_VERSION"));
+/// mcp_core::run_simple(config, || async { Ok(Svc) }).await
+/// # }
+/// ```
+pub async fn run_simple<S, Build, Fut>(
+    config: crate::config::ServerConfig,
+    build: Build,
+) -> Result<()>
+where
+    S: McpService,
+    Build: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<S>>,
+{
+    #[derive(clap::Args)]
+    struct NoArgs {}
+
+    run::<NoArgs, S, _, _>(config, |_no_args| build()).await
+}

@@ -57,6 +57,10 @@
 //!     mcp_core::run::<Local, _, _, _>(config, |_local| async { Ok(Echo) }).await
 //! }
 //! ```
+//!
+//! Stdio and unix transports work with the default features; enable websocket
+//! with `features = ["websocket"]`. A server with no extra flags can use
+//! [`run_simple`] (no turbofish, no empty args struct) instead of [`run`].
 
 pub mod args;
 pub mod config;
@@ -76,7 +80,7 @@ pub use service::{CallError, Content, McpService, ToolDef, ToolReply};
 pub use runner::serve_unix;
 #[cfg(feature = "websocket")]
 pub use runner::serve_websocket;
-pub use runner::{run, serve, serve_stdio};
+pub use runner::{run, run_simple, serve, serve_stdio};
 
 /// Re-exported so servers can write `#[mcp_core::async_trait]` without adding
 /// `async-trait` to their own dependencies.

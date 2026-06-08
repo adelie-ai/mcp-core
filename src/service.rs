@@ -21,6 +21,16 @@ pub trait McpService: Send + Sync + 'static {
     /// per the MCP spec, not as a JSON-RPC protocol error. Reserve
     /// [`CallError::InvalidParams`]/[`CallError::Internal`] for genuine
     /// protocol-level faults.
+    ///
+    /// Mapping guide:
+    /// - missing/unparseable argument → [`CallError::InvalidParams`] (`-32602`)
+    /// - valid input but no result (e.g. "not found", upstream `429`/`5xx`) →
+    ///   [`CallError::Tool`] (`isError` content the model can react to)
+    /// - unknown tool name → [`CallError::Tool`]
+    /// - bug / serialize failure → [`CallError::Internal`] (`-32603`)
+    ///
+    /// `serde_json::Error` converts into [`CallError::Internal`], so
+    /// `ToolReply::json(&value)?` can be used directly in this method.
     async fn call_tool(&self, name: &str, arguments: &Value) -> Result<ToolReply, CallError>;
 
     /// Optional shutdown hook (called on a `shutdown` request).
@@ -218,3 +228,10 @@ impl std::fmt::Display for CallError {
 }
 
 impl std::error::Error for CallError {}
+
+impl From<serde_json::Error> for CallError {
+    /// A (de)serialization failure is an internal fault.
+    fn from(e: serde_json::Error) -> Self {
+        CallError::Internal(e.to_string())
+    }
+}
