@@ -1,0 +1,41 @@
+[package]
+name = "mcp-core"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Shared core for the adelie-ai hand-rolled MCP servers: JSON-RPC 2.0 protocol/dispatch, stdio/websocket/unix transports, and a standard Clap CLI with a per-server extension hook."
+repository = "https://github.com/adelie-ai/mcp-core"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+async-trait = "0.1"
+clap = { version = "4.5", features = ["derive"] }
+tokio = { version = "1.48", features = [
+    "io-std",
+    "io-util",
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "net",
+    "sync",
+] }
+# WebSocket transport (optional — disable default features to drop axum entirely).
+axum = { version = "0.8", features = ["ws"], optional = true }
+futures-util = { version = "0.3", optional = true }
+
+[features]
+default = ["websocket"]
+# Pulls in axum for the WebSocket transport. A server that only ever speaks
+# stdio/unix can `default-features = false` to avoid the axum dependency.
+websocket = ["dep:axum", "dep:futures-util"]
+# Unix-domain-socket transport. Uses tokio's net (already a dependency), so this
+# feature only gates the code, not extra crates.
+unix = []
+
+[lints.rust]
+warnings = "deny"
+
+[lints.clippy]
+all = "deny"
