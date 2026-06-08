@@ -10,8 +10,9 @@ use crate::config::TransportKind;
 #[derive(clap::Args, Clone, Debug)]
 pub struct CommonServeArgs {
     /// Transport to serve over. Defaults to the server's configured default
-    /// (usually stdio).
-    #[arg(long, value_enum)]
+    /// (usually stdio). `--mode` is accepted as a back-compat alias (the
+    /// pre-mcp-core servers used `--mode stdio`).
+    #[arg(long, value_enum, alias = "mode")]
     pub transport: Option<TransportKind>,
 
     /// Host to bind for the websocket transport. `127.0.0.1` keeps it local;
