@@ -66,6 +66,28 @@ impl Session {
     /// Handle one parsed JSON-RPC message and produce the response (if any) and
     /// any notifications to flush.
     pub async fn handle_message(&mut self, message: Value) -> Dispatch {
+        // MC-5: a JSON-RPC payload must be a single Request/Notification object.
+        // An array (batch) or any non-object scalar is not a valid Request — and
+        // we don't support batching despite advertising protocol versions that
+        // define it — so answer INVALID_REQUEST with a null id rather than
+        // silently dropping it (an array has no `id`, so the old code treated it
+        // as a notification and never replied, hanging the client).
+        if !message.is_object() {
+            let msg = if message.is_array() {
+                "batch requests (JSON arrays) are not supported"
+            } else {
+                "request must be a JSON object"
+            };
+            return Dispatch {
+                response: Some(error_response(
+                    Some(Value::Null),
+                    code::INVALID_REQUEST,
+                    msg,
+                )),
+                notifications: Vec::new(),
+            };
+        }
+
         let id = message.get("id").cloned();
         // Per JSON-RPC, a message with no `id` member is a notification and
         // must never receive a response — not even an error.
@@ -104,6 +126,8 @@ impl Session {
                 }
             }
             Some("tools/call") => self.handle_tools_call(&params, &mut notifications).await,
+            // `shutdown` is a non-spec (LSP-style) convenience extension — see
+            // `McpService::shutdown`. Standard MCP clients close the transport.
             Some("shutdown") => {
                 self.core.service.shutdown().await;
                 self.initialized = false;
@@ -352,6 +376,33 @@ mod tests {
             .handle_message(json!({"jsonrpc": "2.0", "method": "some/unknown"}))
             .await;
         assert!(d2.response.is_none());
+    }
+
+    #[tokio::test]
+    async fn batch_array_is_invalid_request_not_silently_dropped() {
+        // MC-5: a JSON-RPC batch (array) payload must get an INVALID_REQUEST
+        // response (null id), not be silently treated as a notification — we
+        // advertise protocol versions that define batching but don't support it.
+        let mut s = session();
+        let d = s
+            .handle_message(json!([
+                {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                {"jsonrpc": "2.0", "id": 2, "method": "ping"}
+            ]))
+            .await;
+        let resp = d.response.expect("batch array must produce a response");
+        assert_eq!(resp["error"]["code"], code::INVALID_REQUEST);
+        assert_eq!(resp["id"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn non_object_payload_is_invalid_request() {
+        // A bare scalar (not an object/array) is also not a valid Request.
+        let mut s = session();
+        let d = s.handle_message(json!("hello")).await;
+        let resp = d.response.expect("scalar must produce a response");
+        assert_eq!(resp["error"]["code"], code::INVALID_REQUEST);
+        assert_eq!(resp["id"], Value::Null);
     }
 
     #[tokio::test]

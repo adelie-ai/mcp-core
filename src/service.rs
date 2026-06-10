@@ -33,7 +33,13 @@ pub trait McpService: Send + Sync + 'static {
     /// `ToolReply::json(&value)?` can be used directly in this method.
     async fn call_tool(&self, name: &str, arguments: &Value) -> Result<ToolReply, CallError>;
 
-    /// Optional shutdown hook (called on a `shutdown` request).
+    /// Optional shutdown hook.
+    ///
+    /// Note: `shutdown` is **not** part of the MCP spec (it's borrowed from
+    /// LSP). mcp-core accepts a JSON-RPC `shutdown` request as a convenience
+    /// extension and calls this hook; standard MCP clients close the transport
+    /// instead and never send it. Don't rely on it for correctness — treat it
+    /// as a best-effort cleanup signal.
     async fn shutdown(&self) {}
 }
 

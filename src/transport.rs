@@ -265,13 +265,14 @@ mod tests {
             buf: &mut tokio::io::ReadBuf<'_>,
         ) -> std::task::Poll<std::io::Result<()>> {
             self.chunks += 1;
-            if self.chunks % 8 == 0 {
+            if self.chunks.is_multiple_of(8) {
                 // Yield so the runtime can poll other tasks (e.g. the timeout).
                 cx.waker().wake_by_ref();
                 return std::task::Poll::Pending;
             }
-            let n = buf.remaining().min(4096);
-            buf.put_slice(&vec![b'a'; n]);
+            const CHUNK: [u8; 4096] = [b'a'; 4096];
+            let n = buf.remaining().min(CHUNK.len());
+            buf.put_slice(&CHUNK[..n]);
             std::task::Poll::Ready(Ok(()))
         }
     }
@@ -320,7 +321,7 @@ mod tests {
     /// Non-UTF-8 bytes in a line are an InvalidMessage error, not a panic.
     #[tokio::test]
     async fn newline_invalid_utf8_is_invalid_message() {
-        let input = vec![0xff, 0xfe, b'\n'];
+        let input = [0xff, 0xfe, b'\n'];
         let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 64);
         let err = t.read_message().await.unwrap_err();
         assert!(err.to_string().contains("invalid UTF-8"), "{err}");
