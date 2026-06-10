@@ -66,6 +66,28 @@ impl Session {
     /// Handle one parsed JSON-RPC message and produce the response (if any) and
     /// any notifications to flush.
     pub async fn handle_message(&mut self, message: Value) -> Dispatch {
+        // MC-5: a JSON-RPC payload must be a single Request/Notification object.
+        // An array (batch) or any non-object scalar is not a valid Request — and
+        // we don't support batching despite advertising protocol versions that
+        // define it — so answer INVALID_REQUEST with a null id rather than
+        // silently dropping it (an array has no `id`, so the old code treated it
+        // as a notification and never replied, hanging the client).
+        if !message.is_object() {
+            let msg = if message.is_array() {
+                "batch requests (JSON arrays) are not supported"
+            } else {
+                "request must be a JSON object"
+            };
+            return Dispatch {
+                response: Some(error_response(
+                    Some(Value::Null),
+                    code::INVALID_REQUEST,
+                    msg,
+                )),
+                notifications: Vec::new(),
+            };
+        }
+
         let id = message.get("id").cloned();
         // Per JSON-RPC, a message with no `id` member is a notification and
         // must never receive a response — not even an error.
@@ -104,6 +126,8 @@ impl Session {
                 }
             }
             Some("tools/call") => self.handle_tools_call(&params, &mut notifications).await,
+            // `shutdown` is a non-spec (LSP-style) convenience extension — see
+            // `McpService::shutdown`. Standard MCP clients close the transport.
             Some("shutdown") => {
                 self.core.service.shutdown().await;
                 self.initialized = false;

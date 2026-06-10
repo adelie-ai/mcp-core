@@ -72,10 +72,10 @@ where
         let raw = match transport.read_message().await {
             Ok(m) => m,
             Err(Error::Transport(TransportError::ConnectionClosed)) => return Ok(()),
-            Err(e) => {
-                eprintln!("mcp-core: transport read error: {e}");
-                return Ok(());
-            }
+            // MC-4: a genuine read error (malformed framing, an oversize frame)
+            // must propagate so the caller can exit non-zero — not be swallowed
+            // as a clean shutdown, which would make the server silently go dark.
+            Err(e) => return Err(e),
         };
         if raw.trim().is_empty() {
             continue;
@@ -107,14 +107,50 @@ where
     }
 }
 
+/// Prepare `path` for binding a unix socket: if something already exists there,
+/// remove it **only if it is itself a socket** (a stale socket from a prior
+/// run). Refuse to delete a regular file, directory, or other node — that would
+/// be silent data loss if a server is pointed at the wrong path. A non-existent
+/// path is fine.
+#[cfg(feature = "unix")]
+fn prepare_unix_socket_path(path: &str) -> Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+
+    // `symlink_metadata` does not follow symlinks, so a symlink is reported as
+    // a symlink (not a socket) and is therefore refused rather than followed.
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => {
+            std::fs::remove_file(path)?;
+            Ok(())
+        }
+        Ok(_) => Err(Error::Config(format!(
+            "refusing to bind unix socket: {path} exists and is not a socket"
+        ))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Restrict a freshly-bound unix socket to the owner (`0600`) so other local
+/// users can't connect to a server that trusts local callers.
+#[cfg(feature = "unix")]
+fn restrict_socket_perms(path: &str) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
+
 /// Serve over a unix-domain socket, one [`Session`] per connection.
 #[cfg(feature = "unix")]
 pub async fn serve_unix(core: Arc<ServerCore>, path: &str) -> Result<()> {
     use tokio::io::BufReader;
     use tokio::net::UnixListener;
 
-    let _ = std::fs::remove_file(path);
+    // MC-8: only unlink a stale socket, never a regular file; then lock the
+    // socket down to the owner.
+    prepare_unix_socket_path(path)?;
     let listener = UnixListener::bind(path)?;
+    restrict_socket_perms(path)?;
     eprintln!("mcp-core: listening on unix socket {path}");
     loop {
         let (stream, _addr) = listener.accept().await?;
@@ -195,7 +231,11 @@ async fn ws_handler(
         return (axum::http::StatusCode::UNAUTHORIZED, e.to_string()).into_response();
     }
     let core = Arc::clone(&state.core);
-    ws.on_upgrade(move |socket| ws_connection(socket, core))
+    // MC-6: cap inbound frame size at the configured max so a huge websocket
+    // message can't exhaust memory (mirrors the framed-transport cap).
+    let max = core.config().max_content_length;
+    ws.max_message_size(max)
+        .on_upgrade(move |socket| ws_connection(socket, core))
 }
 
 #[cfg(all(feature = "websocket", not(feature = "auth")))]
@@ -204,7 +244,10 @@ async fn ws_handler(
     ws: axum::extract::ws::WebSocketUpgrade,
 ) -> axum::response::Response {
     let core = Arc::clone(&state.core);
-    ws.on_upgrade(move |socket| ws_connection(socket, core))
+    // MC-6: cap inbound frame size at the configured max (see auth variant).
+    let max = core.config().max_content_length;
+    ws.max_message_size(max)
+        .on_upgrade(move |socket| ws_connection(socket, core))
 }
 
 #[cfg(feature = "websocket")]
@@ -265,7 +308,7 @@ where
     Build: FnOnce(L) -> Fut,
     Fut: std::future::Future<Output = Result<S>>,
 {
-    use clap::Parser;
+    use clap::{CommandFactory, FromArgMatches};
 
     #[derive(clap::Parser)]
     struct Cli<L: clap::Args> {
@@ -284,9 +327,16 @@ where
         },
     }
 
+    // MC-10: report the *server's* name/version (from ServerConfig) for
+    // `--version` and in `--help`, rather than mcp-core's own crate metadata.
+    let command = Cli::<L>::command()
+        .name(config.name.clone())
+        .version(config.version.clone());
+    let matches = command.get_matches();
     let Cli {
         command: Cmd::Serve { common, local },
-    } = Cli::<L>::parse();
+    } = Cli::<L>::from_arg_matches(&matches)
+        .map_err(|e| Error::Config(format!("argument parsing: {e}")))?;
 
     let service = build(local).await?;
     let core = ServerCore::new(config, Arc::new(service));

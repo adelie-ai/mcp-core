@@ -97,10 +97,16 @@ fn extract_bearer(headers: &HeaderMap) -> std::result::Result<String, AuthError>
         .ok_or_else(|| AuthError("missing Authorization header".into()))?
         .to_str()
         .map_err(|_| AuthError("invalid Authorization header".into()))?;
-    let token = value
-        .strip_prefix("Bearer ")
-        .ok_or_else(|| AuthError("expected `Authorization: Bearer <token>`".into()))?
-        .trim();
+    // MC-9: RFC 7235 auth-scheme names are case-insensitive ("Bearer",
+    // "bearer", "BEARER" are all valid). Split off the first whitespace-
+    // delimited token and compare the scheme case-insensitively.
+    let (scheme, rest) = value
+        .split_once(' ')
+        .ok_or_else(|| AuthError("expected `Authorization: Bearer <token>`".into()))?;
+    if !scheme.eq_ignore_ascii_case("Bearer") {
+        return Err(AuthError("expected `Authorization: Bearer <token>`".into()));
+    }
+    let token = rest.trim();
     if token.is_empty() {
         return Err(AuthError("empty Bearer token".into()));
     }
