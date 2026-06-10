@@ -241,4 +241,47 @@ mod tests {
         assert!(a.check(&h).await.is_err());
         assert!(a.check(&bearer("")).await.is_err());
     }
+
+    #[test]
+    fn bearer_scheme_is_case_insensitive() {
+        // MC-9: RFC 7235 auth-scheme names are case-insensitive.
+        for scheme in ["Bearer", "bearer", "BEARER", "BeArEr"] {
+            let mut h = HeaderMap::new();
+            h.insert(
+                axum::http::header::AUTHORIZATION,
+                format!("{scheme} tok123").parse().unwrap(),
+            );
+            assert_eq!(
+                extract_bearer(&h).unwrap(),
+                "tok123",
+                "scheme {scheme} should be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn bearer_optional_whitespace_and_empty_token() {
+        // Extra spaces after the scheme are tolerated; an empty token is not.
+        let mut h = HeaderMap::new();
+        h.insert(
+            axum::http::header::AUTHORIZATION,
+            "bearer    spaced".parse().unwrap(),
+        );
+        assert_eq!(extract_bearer(&h).unwrap(), "spaced");
+
+        let mut empty = HeaderMap::new();
+        empty.insert(
+            axum::http::header::AUTHORIZATION,
+            "bearer    ".parse().unwrap(),
+        );
+        assert!(extract_bearer(&empty).is_err());
+
+        // A non-Bearer scheme is still rejected.
+        let mut basic = HeaderMap::new();
+        basic.insert(
+            axum::http::header::AUTHORIZATION,
+            "Basic abc".parse().unwrap(),
+        );
+        assert!(extract_bearer(&basic).is_err());
+    }
 }

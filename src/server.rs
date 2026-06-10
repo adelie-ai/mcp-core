@@ -355,6 +355,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn batch_array_is_invalid_request_not_silently_dropped() {
+        // MC-5: a JSON-RPC batch (array) payload must get an INVALID_REQUEST
+        // response (null id), not be silently treated as a notification — we
+        // advertise protocol versions that define batching but don't support it.
+        let mut s = session();
+        let d = s
+            .handle_message(json!([
+                {"jsonrpc": "2.0", "id": 1, "method": "ping"},
+                {"jsonrpc": "2.0", "id": 2, "method": "ping"}
+            ]))
+            .await;
+        let resp = d.response.expect("batch array must produce a response");
+        assert_eq!(resp["error"]["code"], code::INVALID_REQUEST);
+        assert_eq!(resp["id"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn non_object_payload_is_invalid_request() {
+        // A bare scalar (not an object/array) is also not a valid Request.
+        let mut s = session();
+        let d = s.handle_message(json!("hello")).await;
+        let resp = d.response.expect("scalar must produce a response");
+        assert_eq!(resp["error"]["code"], code::INVALID_REQUEST);
+        assert_eq!(resp["id"], Value::Null);
+    }
+
+    #[tokio::test]
     async fn tools_list_requires_initialize() {
         let mut s = session();
         let d = s
