@@ -2,8 +2,11 @@
 //!
 //! Supports both newline-delimited JSON and LSP-style
 //! `Content-Length: N\r\n\r\n<bytes>` framing, auto-detected from the first
-//! line. A configurable size cap is enforced *before* allocating, so a peer
-//! can't trigger an OOM with a huge `Content-Length` (or an endless line).
+//! line. A configurable size cap (`max_len`) bounds memory in both modes:
+//! Content-Length is checked against the cap *before* the body buffer is
+//! allocated, and newline lines are read incrementally and rejected after at
+//! most `max_len + 1` bytes — so a peer can't trigger an OOM with a huge
+//! `Content-Length` *or* an endless newline-free line.
 
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Stdin,
@@ -106,15 +109,43 @@ where
         Ok(())
     }
 
+    /// Read one `\n`-terminated line (newline included), enforcing `max_len`
+    /// *while* reading so a peer that never sends a newline can't exhaust
+    /// memory: we stop and error after at most `max_len + 1` bytes. The result
+    /// is UTF-8-validated and surfaced as [`TransportError::InvalidMessage`] on
+    /// failure (not an opaque io error).
     async fn read_line(&mut self) -> Result<String> {
-        let mut line = String::new();
-        let n = self.reader.read_line(&mut line).await?;
-        if n == 0 {
-            return Err(TransportError::ConnectionClosed.into());
+        let mut buf: Vec<u8> = Vec::new();
+        loop {
+            let available = self.reader.fill_buf().await?;
+            if available.is_empty() {
+                // Clean EOF. A trailing line without a final newline is still a
+                // complete message; only a truly empty read is "closed".
+                if buf.is_empty() {
+                    return Err(TransportError::ConnectionClosed.into());
+                }
+                break;
+            }
+            // How much of this chunk to consume, bounded so we never buffer
+            // more than `max_len + 1` bytes total before checking the cap.
+            let remaining_budget = self.max_len.saturating_sub(buf.len()) + 1;
+            let take = available.len().min(remaining_budget);
+            if let Some(nl) = available[..take].iter().position(|&b| b == b'\n') {
+                buf.extend_from_slice(&available[..=nl]);
+                self.reader.consume(nl + 1);
+                break;
+            }
+            buf.extend_from_slice(&available[..take]);
+            self.reader.consume(take);
+            // No newline within the budget we just consumed → the line is at
+            // least `max_len + 1` bytes. Reject without reading further.
+            self.check_len(buf.len(), "line length")?;
         }
-        // Bound newline-mode lines so an endless line can't exhaust memory.
-        self.check_len(line.len(), "line length")?;
-        Ok(line)
+        // Belt-and-suspenders: a line that ends exactly at the cap is fine, but
+        // anything longer (shouldn't happen given the loop) is rejected.
+        self.check_len(buf.len(), "line length")?;
+        String::from_utf8(buf)
+            .map_err(|e| TransportError::InvalidMessage(format!("invalid UTF-8: {e}")).into())
     }
 
     async fn read_newline(&mut self) -> Result<String> {
