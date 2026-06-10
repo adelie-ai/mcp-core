@@ -32,6 +32,10 @@ jsonwebtoken = { version = "10", default-features = false, features = [
 jwtk = { version = "0.5", optional = true }
 reqwest = { version = "0.13", features = ["json"], optional = true }
 
+[dev-dependencies]
+# `time` is only needed by tests (timeouts around reads that must terminate).
+tokio = { version = "1.48", features = ["time"] }
+
 [features]
 # Stdio + unix are free (no extra crates), so they're on by default. The
 # websocket transport pulls in axum, so it is strictly opt-in — most MCP servers

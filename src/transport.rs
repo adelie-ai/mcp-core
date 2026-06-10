@@ -211,4 +211,87 @@ mod tests {
         let err = t.read_message().await.unwrap_err();
         assert!(err.to_string().contains("exceeds maximum"), "{err}");
     }
+
+    // --- MC-1: newline framing must bound memory, not just check after the fact ---
+
+    /// An infinite reader that yields `b'a'` forever and never a newline.
+    /// If `read_message` buffers the whole "line" before checking the cap,
+    /// reading from this never terminates (and memory grows without bound).
+    ///
+    /// It returns `Pending` (after re-waking) every few chunks so the test's
+    /// `tokio::time::timeout` can actually fire if the read isn't bounded —
+    /// otherwise a tight always-`Ready` loop would starve the timer and the
+    /// failing test would hang the harness instead of failing cleanly.
+    #[derive(Default)]
+    struct EndlessLine {
+        chunks: usize,
+    }
+
+    impl tokio::io::AsyncRead for EndlessLine {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.chunks += 1;
+            if self.chunks % 8 == 0 {
+                // Yield so the runtime can poll other tasks (e.g. the timeout).
+                cx.waker().wake_by_ref();
+                return std::task::Poll::Pending;
+            }
+            let n = buf.remaining().min(4096);
+            buf.put_slice(&vec![b'a'; n]);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// MC-1 acceptance: a line exceeding `max_len` errors out after reading at
+    /// most `max_len + 1` bytes — it must not buffer the line first.
+    #[tokio::test]
+    async fn newline_line_exceeding_max_errors_with_bounded_memory() {
+        let mut t = FramedTransport::new(BufReader::new(EndlessLine::default()), Vec::new(), 64);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), t.read_message())
+            .await
+            .expect("read_message must terminate on an endless line (bounded read)");
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum"), "{err}");
+    }
+
+    /// MC-1 acceptance: a finite oversize line is rejected, not returned.
+    #[tokio::test]
+    async fn newline_finite_oversize_line_is_rejected() {
+        let mut input = vec![b'x'; 10_000];
+        input.push(b'\n');
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 1024);
+        let err = t.read_message().await.unwrap_err();
+        assert!(err.to_string().contains("exceeds maximum"), "{err}");
+    }
+
+    /// A line of exactly the cap (content + newline ≤ max) still reads fine.
+    #[tokio::test]
+    async fn newline_line_at_cap_is_accepted() {
+        let body = "y".repeat(63); // 63 + '\n' = 64 = max
+        let input = format!("{body}\n").into_bytes();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 64);
+        assert_eq!(t.read_message().await.unwrap(), body);
+    }
+
+    /// Bounded reads must not eat into the *next* line when the current line
+    /// fits: framing stays intact across messages.
+    #[tokio::test]
+    async fn bounded_read_preserves_framing_across_messages() {
+        let input = b"{\"a\":1}\n{\"b\":2}\n".to_vec();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 8);
+        assert_eq!(t.read_message().await.unwrap(), "{\"a\":1}");
+        assert_eq!(t.read_message().await.unwrap(), "{\"b\":2}");
+    }
+
+    /// Non-UTF-8 bytes in a line are an InvalidMessage error, not a panic.
+    #[tokio::test]
+    async fn newline_invalid_utf8_is_invalid_message() {
+        let input = vec![0xff, 0xfe, b'\n'];
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 64);
+        let err = t.read_message().await.unwrap_err();
+        assert!(err.to_string().contains("invalid UTF-8"), "{err}");
+    }
 }
