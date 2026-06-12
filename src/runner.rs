@@ -196,7 +196,13 @@ pub async fn serve_websocket(core: Arc<ServerCore>, host: &str, port: u16) -> Re
 
     #[cfg(feature = "auth")]
     let state = {
-        let auth = Arc::new(crate::auth::Authenticator::from(core.config().ws_auth.clone()).await?);
+        let auth = Arc::new(
+            crate::auth::Authenticator::from(
+                core.config().ws_auth.clone(),
+                core.config().ws_claim_bindings.clone(),
+            )
+            .await?,
+        );
         if auth.is_enabled() {
             eprintln!("mcp-core: websocket Bearer-token authentication enabled");
         }

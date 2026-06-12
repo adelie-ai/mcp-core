@@ -75,6 +75,7 @@ pub mod transport;
 pub use args::CommonServeArgs;
 pub use config::{
     DEFAULT_MAX_CONTENT_LENGTH, EnabledTransports, ServerConfig, TransportKind, WsAuth,
+    WsClaimBindings,
 };
 pub use error::{Error, Result, TransportError, code};
 pub use server::{Dispatch, ServerCore, Session};

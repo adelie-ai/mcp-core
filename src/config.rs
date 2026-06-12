@@ -25,8 +25,15 @@ impl std::fmt::Display for TransportKind {
     }
 }
 
-/// Which transports a given server is willing to serve. Defaults to
-/// stdio + websocket (the historical behaviour); unix is opt-in.
+/// Which transports a given server is willing to serve. Defaults to **stdio
+/// only**: both the network-facing websocket transport and the unix-socket
+/// transport are opt-in.
+///
+/// MC-7: websocket used to be on by default, so every server exposed an
+/// (often unauthenticated) network transport unless it remembered
+/// `.without_websocket()` — half the fleet forgot. It now fails closed: a
+/// server must explicitly call [`ServerConfig::with_websocket`] to serve over
+/// the network.
 #[derive(Clone, Copy, Debug)]
 pub struct EnabledTransports {
     /// Allow the stdio transport.
@@ -41,7 +48,7 @@ impl Default for EnabledTransports {
     fn default() -> Self {
         Self {
             stdio: true,
-            websocket: true,
+            websocket: false,
             unix: false,
         }
     }
@@ -61,6 +68,12 @@ impl EnabledTransports {
 /// WebSocket authentication strategy. Validated before the upgrade. Anything
 /// other than [`WsAuth::None`] requires mcp-core to be built with the `auth`
 /// feature; it is ignored by the stdio/unix transports (local = trusted).
+///
+/// Issuer/audience claim bindings (MC-2) are configured separately, via
+/// [`ServerConfig::websocket_expected_issuer`] /
+/// [`ServerConfig::websocket_expected_audience`], so they apply uniformly to
+/// every strategy. The [`WsAuth::OidcIssuer`] strategy additionally binds the
+/// token's `iss` to the discovered issuer automatically.
 #[derive(Clone, Debug, Default)]
 pub enum WsAuth {
     /// No authentication (default) — anyone who can reach the socket.
@@ -75,6 +88,18 @@ pub enum WsAuth {
     OidcIssuer(String),
 }
 
+/// Issuer/audience claim bindings applied on top of a [`WsAuth`] strategy
+/// (MC-2). An empty set leaves the corresponding claim unchecked; when set, the
+/// token's `iss` must equal `issuer` and its `aud` must contain `audience`.
+#[derive(Clone, Debug, Default)]
+pub struct WsClaimBindings {
+    /// Required `iss` claim. `None` leaves the issuer unchecked (except for
+    /// [`WsAuth::OidcIssuer`], which always binds to its discovered issuer).
+    pub issuer: Option<String>,
+    /// Required `aud` claim (the token's `aud` must contain this value).
+    pub audience: Option<String>,
+}
+
 /// MCP protocol versions this core knows how to negotiate, newest last.
 pub const DEFAULT_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
 
@@ -83,7 +108,7 @@ pub const DEFAULT_MAX_CONTENT_LENGTH: usize = 64 * 1024 * 1024;
 
 /// Everything mcp-core needs to know about a server at startup. Construct with
 /// [`ServerConfig::new`] and tweak via the builder methods when the defaults
-/// aren't right (e.g. [`ServerConfig::without_websocket`]).
+/// aren't right (e.g. [`ServerConfig::with_websocket`]).
 #[derive(Clone, Debug)]
 pub struct ServerConfig {
     /// `serverInfo.name` reported in the initialize response.
@@ -106,6 +131,8 @@ pub struct ServerConfig {
     /// WebSocket authentication strategy (default [`WsAuth::None`]). Requires
     /// the `auth` feature when not `None`.
     pub ws_auth: WsAuth,
+    /// Issuer/audience bindings layered on top of [`Self::ws_auth`] (MC-2).
+    pub ws_claim_bindings: WsClaimBindings,
 }
 
 impl ServerConfig {
@@ -125,6 +152,7 @@ impl ServerConfig {
             tools_list_changed: false,
             max_content_length: DEFAULT_MAX_CONTENT_LENGTH,
             ws_auth: WsAuth::None,
+            ws_claim_bindings: WsClaimBindings::default(),
         }
     }
 
@@ -134,8 +162,21 @@ impl ServerConfig {
         self
     }
 
+    /// Enable the network-facing websocket transport for this server (MC-7:
+    /// opt-in). Until called, requesting `--transport websocket` fails closed
+    /// with a clear config error. Pair it with [`Self::websocket_auth`] for any
+    /// untrusted network.
+    pub fn with_websocket(mut self) -> Self {
+        self.transports.websocket = true;
+        self
+    }
+
     /// Disable the websocket transport for this server. If websocket was the
     /// default transport it falls back to stdio.
+    ///
+    /// MC-7: websocket is now off by default, so this is rarely needed; it is
+    /// retained so a server that toggles transports dynamically can still turn
+    /// it back off.
     pub fn without_websocket(mut self) -> Self {
         self.transports.websocket = false;
         if self.default_transport == TransportKind::Websocket {
@@ -175,6 +216,21 @@ impl ServerConfig {
         self
     }
 
+    /// Require the validated token's `iss` claim to equal `issuer` (MC-2).
+    /// Applies to every [`WsAuth`] strategy. Without this, any token from the
+    /// same IdP — issued for a different service — would authenticate.
+    pub fn websocket_expected_issuer(mut self, issuer: impl Into<String>) -> Self {
+        self.ws_claim_bindings.issuer = Some(issuer.into());
+        self
+    }
+
+    /// Require the validated token's `aud` claim to contain `audience` (MC-2).
+    /// Applies to every [`WsAuth`] strategy.
+    pub fn websocket_expected_audience(mut self, audience: impl Into<String>) -> Self {
+        self.ws_claim_bindings.audience = Some(audience.into());
+        self
+    }
+
     /// The newest supported protocol version (returned when a client requests
     /// one we don't recognise).
     pub(crate) fn latest_protocol_version(&self) -> &str {
@@ -182,5 +238,50 @@ impl ServerConfig {
             .last()
             .map(|s| s.as_str())
             .unwrap_or("2025-06-18")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn websocket_off_by_default() {
+        // MC-7: a fresh config exposes stdio only; the network transport is
+        // opt-in and fails closed until `with_websocket()`.
+        let cfg = ServerConfig::new("x", "1.0");
+        assert!(cfg.transports.allows(TransportKind::Stdio));
+        assert!(
+            !cfg.transports.allows(TransportKind::Websocket),
+            "websocket must be off by default (MC-7)"
+        );
+        assert!(!cfg.transports.allows(TransportKind::Unix));
+    }
+
+    #[test]
+    fn with_websocket_opts_in() {
+        let cfg = ServerConfig::new("x", "1.0").with_websocket();
+        assert!(cfg.transports.allows(TransportKind::Websocket));
+    }
+
+    #[test]
+    fn without_websocket_still_works() {
+        // Idempotent / round-trips: opt in then back out.
+        let cfg = ServerConfig::new("x", "1.0")
+            .with_websocket()
+            .without_websocket();
+        assert!(!cfg.transports.allows(TransportKind::Websocket));
+    }
+
+    #[test]
+    fn claim_binding_builders() {
+        let cfg = ServerConfig::new("x", "1.0")
+            .websocket_expected_issuer("https://idp.example")
+            .websocket_expected_audience("mcp-core");
+        assert_eq!(
+            cfg.ws_claim_bindings.issuer.as_deref(),
+            Some("https://idp.example")
+        );
+        assert_eq!(cfg.ws_claim_bindings.audience.as_deref(), Some("mcp-core"));
     }
 }
