@@ -2,18 +2,36 @@
 //!
 //! Supports both newline-delimited JSON and LSP-style
 //! `Content-Length: N\r\n\r\n<bytes>` framing, auto-detected from the first
-//! line. A configurable size cap (`max_len`) bounds memory in both modes:
-//! Content-Length is checked against the cap *before* the body buffer is
-//! allocated, and newline lines are read incrementally and rejected after at
-//! most `max_len + 1` bytes — so a peer can't trigger an OOM with a huge
-//! `Content-Length` *or* an endless newline-free line.
+//! line.
+//!
+//! Nothing a peer declares about a frame is trusted before it is checked. A
+//! configurable size cap (`max_len`) bounds memory in both modes: a declared
+//! `Content-Length` is range-checked against the cap before any body buffer
+//! exists and the body then grows with the bytes that actually arrive, while
+//! newline lines are read incrementally and rejected after at most
+//! `max_len + 1` bytes. So neither a huge `Content-Length`, nor a lie about one,
+//! nor an endless newline-free line can exhaust memory. The header block is
+//! bounded too ([`MAX_HEADER_LINES`]), so one frame cannot cost unbounded reads.
+//!
+//! A frame the transport does not finish reading ends the stream - whether it
+//! was refused outright (an oversize body is never read, an oversize line is
+//! abandoned mid-line) or given up on part-way through (an undecodable header,
+//! an io failure inside a declared body). Its remaining bytes stay in the
+//! stream, so the position of the next frame is unknowable, and carrying on
+//! would let a peer hide a well-formed frame behind the abandoned one. The
+//! transport therefore marks itself desynchronised and every later read fails,
+//! leaving the caller to close the connection.
+//!
+//! The one exception is a frame that *was* consumed in full and only then found
+//! unusable: a body - or a newline-delimited line - that is not UTF-8. Framing
+//! is intact there, so that read fails and the next one proceeds normally.
 
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Stdin,
     Stdout,
 };
 
-use crate::error::{Result, TransportError};
+use crate::error::{Error, Result, TransportError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Framing {
@@ -22,16 +40,49 @@ enum Framing {
     ContentLength,
 }
 
+/// Upper bound on the header lines one `Content-Length` frame may carry.
+///
+/// Why: real peers send one or two (`Content-Length`, occasionally
+/// `Content-Type`). Each line is individually bounded by `max_len`, but the
+/// header block is not, so without a count a peer can keep a server reading
+/// headers for a single frame forever.
+pub const MAX_HEADER_LINES: usize = 64;
+
+/// Upper bound on the peer-supplied characters an error message echoes back.
+/// Enough to diagnose a bad header. Short enough that a refused frame cannot
+/// turn our error path into a carrier for the peer's own bytes.
+const ERROR_ECHO_LIMIT: usize = 64;
+
 fn trim_crlf(s: &str) -> &str {
     s.trim_end_matches(['\r', '\n'])
 }
 
-fn parse_content_length_header(line: &str) -> Option<usize> {
-    let (name, value) = trim_crlf(line).trim().split_once(':')?;
-    if !name.trim().eq_ignore_ascii_case("content-length") {
-        return None;
+/// Whether `err` is the peer closing the stream cleanly, as opposed to a frame
+/// going wrong. Matched on the variant, never on the rendered message.
+fn is_connection_closed(err: &Error) -> bool {
+    matches!(err, Error::Transport(TransportError::ConnectionClosed))
+}
+
+/// `s` shortened to [`ERROR_ECHO_LIMIT`] characters, marked when shortened.
+fn for_error(s: &str) -> String {
+    match s.char_indices().nth(ERROR_ECHO_LIMIT) {
+        Some((end, _)) => format!("{}...", &s[..end]),
+        None => s.to_string(),
     }
-    value.trim().parse::<usize>().ok()
+}
+
+/// The raw value of `line` if it is a `Content-Length` header, else `None`.
+///
+/// Why recognition is split from parsing: a value that does not parse has to be
+/// a framing *error*, not an unrecognised header. Folding the two together made
+/// `Content-Length: 99999999999999999999999999` (too large for `usize`) look
+/// like an ordinary line, which silently downgraded the stream to newline
+/// framing and handed the frame's own body back to the caller as messages.
+fn content_length_value(line: &str) -> Option<&str> {
+    let (name, value) = trim_crlf(line).trim().split_once(':')?;
+    name.trim()
+        .eq_ignore_ascii_case("content-length")
+        .then(|| value.trim())
 }
 
 /// A framed transport over a buffered reader and a writer.
@@ -40,6 +91,9 @@ pub struct FramedTransport<R, W> {
     writer: W,
     framing: Framing,
     max_len: usize,
+    /// Why framing was lost, once it has been. Set by the first violation and
+    /// never cleared; while set, every read fails. See [`Self::desync_error`].
+    desync: Option<String>,
 }
 
 impl FramedTransport<BufReader<Stdin>, Stdout> {
@@ -65,28 +119,76 @@ where
             writer,
             framing: Framing::Auto,
             max_len,
+            desync: None,
         }
     }
 
-    fn check_len(&self, len: usize, what: &str) -> Result<()> {
+    /// Message for a length that is past the cap, phrased the same way wherever
+    /// the length came from. `shown` may be raw peer text (a declared value can
+    /// carry any number of leading zeros), so it is truncated here rather than at
+    /// each call site.
+    fn too_large(&self, what: &str, shown: &str) -> String {
+        format!(
+            "{what} {} exceeds maximum of {} bytes",
+            for_error(shown),
+            self.max_len
+        )
+    }
+
+    /// Record that framing has been lost, and build the error to return.
+    ///
+    /// Why the transport stays refused: a frame we refuse is never consumed - an
+    /// oversize body is not read, an oversize line is abandoned mid-line - and
+    /// neither is a frame we give up on part-way through, so the next frame
+    /// boundary is unknown. The protocol offers no resynchronisation point, and
+    /// reading on regardless would let a peer hide a well-formed frame behind
+    /// the abandoned one and have it dispatched. The first reason is kept: later
+    /// reads report the original cause, not a cascade.
+    fn desync_error(&mut self, reason: String) -> Error {
+        let reason = self.desync.get_or_insert(reason);
+        TransportError::InvalidMessage(reason.clone()).into()
+    }
+
+    /// Record that framing has been lost for `reason`, and hand `err` back
+    /// unchanged.
+    ///
+    /// Why not [`Self::desync_error`] everywhere: the stream is equally lost
+    /// whether the frame was malformed or our own read of it failed, but those
+    /// are different things to a caller - only the first is the peer's fault -
+    /// so the error keeps its own variant while the transport is poisoned all
+    /// the same.
+    fn poison(&mut self, reason: String, err: Error) -> Error {
+        self.desync.get_or_insert(reason);
+        err
+    }
+
+    /// Refuse `len` if it is past the cap. A violation is unrecoverable, so this
+    /// also desynchronises the transport ([`Self::desync_error`]).
+    fn check_len(&mut self, len: usize, what: &str) -> Result<()> {
         if len > self.max_len {
-            return Err(TransportError::InvalidMessage(format!(
-                "{what} {len} exceeds maximum of {} bytes",
-                self.max_len
-            ))
-            .into());
+            let reason = self.too_large(what, &len.to_string());
+            return Err(self.desync_error(reason));
         }
         Ok(())
     }
 
     /// Read one JSON-RPC message. Returns
-    /// `Err(TransportError::ConnectionClosed)` on clean EOF.
+    /// `Err(TransportError::ConnectionClosed)` on clean EOF, and
+    /// `Err(TransportError::InvalidMessage)` for every framing violation -
+    /// including every later read once one has happened.
     pub async fn read_message(&mut self) -> Result<String> {
+        if let Some(reason) = &self.desync {
+            return Err(TransportError::InvalidMessage(format!(
+                "transport desynchronised by an earlier framing violation ({reason}) \
+                 and cannot be resynchronised"
+            ))
+            .into());
+        }
         match self.framing {
             Framing::Auto => self.read_auto().await,
             Framing::Newline => self.read_newline().await,
             Framing::ContentLength => {
-                let first = self.read_line().await?;
+                let first = self.read_frame_line().await?;
                 self.read_content_length(&first).await
             }
         }
@@ -148,6 +250,27 @@ where
             .map_err(|e| TransportError::InvalidMessage(format!("invalid UTF-8: {e}")).into())
     }
 
+    /// Read a line that belongs to a `Content-Length` frame - the line that
+    /// opens it, or one of its headers.
+    ///
+    /// Any failure other than a clean EOF leaves the reader inside a frame whose
+    /// declared body has not been consumed, so it poisons the transport
+    /// ([`Self::poison`]). Without that, an undecodable header is a
+    /// frame-smuggling primitive: the peer declares a body, makes the read fail
+    /// before it is consumed, and has the frame it placed behind it dispatched
+    /// on the next read. A clean EOF is left alone - the peer is gone, so there
+    /// is nothing left to mistake for a message.
+    async fn read_frame_line(&mut self) -> Result<String> {
+        match self.read_line().await {
+            Ok(line) => Ok(line),
+            Err(err) if is_connection_closed(&err) => Err(err),
+            Err(err) => {
+                let reason = format!("frame abandoned before its body was consumed: {err}");
+                Err(self.poison(reason, err))
+            }
+        }
+    }
+
     async fn read_newline(&mut self) -> Result<String> {
         let line = self.read_line().await?;
         Ok(trim_crlf(&line).to_string())
@@ -160,7 +283,7 @@ where
             if trimmed.trim().is_empty() {
                 continue;
             }
-            if parse_content_length_header(trimmed).is_some() {
+            if content_length_value(trimmed).is_some() {
                 self.framing = Framing::ContentLength;
                 return self.read_content_length(trimmed).await;
             }
@@ -169,23 +292,87 @@ where
         }
     }
 
-    async fn read_content_length(&mut self, first: &str) -> Result<String> {
-        let content_length = parse_content_length_header(first).ok_or_else(|| {
-            TransportError::InvalidMessage(format!("expected Content-Length header, got: {first}"))
-        })?;
-        // Cap before allocating the body buffer.
-        self.check_len(content_length, "Content-Length")?;
+    /// Turn a declared `Content-Length` value into a length we are willing to
+    /// read, or the reason we are not. Rejects anything that is not a plain
+    /// in-range byte count, so no arithmetic downstream can be surprised.
+    fn declared_length(&self, value: &str) -> std::result::Result<usize, String> {
+        if value.is_empty() {
+            return Err("Content-Length header has an empty value".to_string());
+        }
+        if !value.bytes().all(|b| b.is_ascii_digit()) {
+            // Catches signs, whitespace, units, and anything else non-numeric;
+            // a negative value is refused here rather than wrapping.
+            return Err(format!(
+                "Content-Length value {} is not a byte count",
+                for_error(value)
+            ));
+        }
+        match value.parse::<usize>() {
+            Ok(len) if len > self.max_len => Err(self.too_large("Content-Length", value)),
+            Ok(len) => Ok(len),
+            // Digits alone, yet unparseable: larger than `usize` can hold, so
+            // past any cap by definition.
+            Err(_) => Err(self.too_large("Content-Length", value)),
+        }
+    }
 
-        // Consume any remaining headers up to the blank line.
+    async fn read_content_length(&mut self, first: &str) -> Result<String> {
+        // Parsed in its own statement so the immutable borrow of `self` ends
+        // before the arms need it mutably to record a desync.
+        let parsed = content_length_value(first).map(|value| self.declared_length(value));
+        let declared = match parsed {
+            Some(Ok(len)) => len,
+            Some(Err(reason)) => return Err(self.desync_error(reason)),
+            None => {
+                let reason = format!(
+                    "expected a Content-Length header, got: {}",
+                    for_error(first)
+                );
+                return Err(self.desync_error(reason));
+            }
+        };
+
+        // Consume any remaining headers up to the blank line, bounded so one
+        // frame cannot keep us reading headers indefinitely.
+        let mut lines = 1;
         loop {
-            let line = self.read_line().await?;
+            let line = self.read_frame_line().await?;
             if trim_crlf(&line).is_empty() {
                 break;
             }
+            lines += 1;
+            if lines > MAX_HEADER_LINES {
+                let reason = format!("frame declares more than {MAX_HEADER_LINES} header lines");
+                return Err(self.desync_error(reason));
+            }
         }
 
-        let mut buf = vec![0u8; content_length];
-        self.reader.read_exact(&mut buf).await?;
+        // `declared` is within the cap, but it is still only a claim: read at
+        // most that many bytes into a buffer that grows with what actually
+        // arrives, so a peer that declares the cap and sends five bytes costs
+        // five bytes.
+        let mut buf = Vec::new();
+        if let Err(err) = (&mut self.reader)
+            .take(declared as u64)
+            .read_to_end(&mut buf)
+            .await
+        {
+            // Some of the declared body was consumed and the rest is unknown, so
+            // the stream is as lost as after a refused frame - but the cause is
+            // ours, not the peer's, so the caller still sees the io error.
+            let reason = format!(
+                "frame body read failed after {} of {declared} declared bytes: {err}",
+                buf.len()
+            );
+            return Err(self.poison(reason, err.into()));
+        }
+        if buf.len() != declared {
+            let reason = format!(
+                "frame body ended after {} of {declared} declared bytes",
+                buf.len()
+            );
+            return Err(self.desync_error(reason));
+        }
         String::from_utf8(buf)
             .map_err(|e| TransportError::InvalidMessage(format!("invalid UTF-8: {e}")).into())
     }
@@ -193,17 +380,21 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::cell::Cell;
+
     use super::*;
 
+    /// Header *recognition* is by name only, case-insensitively — whether the
+    /// value is usable is a separate question, answered by `declared_length`.
     #[test]
-    fn parses_content_length() {
-        assert_eq!(
-            parse_content_length_header("Content-Length: 10\r\n"),
-            Some(10)
-        );
-        assert_eq!(parse_content_length_header("content-length:  0"), Some(0));
-        assert_eq!(parse_content_length_header("Content-Type: x"), None);
-        assert_eq!(parse_content_length_header("garbage"), None);
+    fn recognises_content_length_header_by_name() {
+        assert_eq!(content_length_value("Content-Length: 10\r\n"), Some("10"));
+        assert_eq!(content_length_value("content-length:  0"), Some("0"));
+        assert_eq!(content_length_value("Content-Length:"), Some(""));
+        assert_eq!(content_length_value("Content-Length: nope"), Some("nope"));
+        assert_eq!(content_length_value("Content-Type: x"), None);
+        assert_eq!(content_length_value("garbage"), None);
     }
 
     #[test]
@@ -325,5 +516,602 @@ mod tests {
         let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 64);
         let err = t.read_message().await.unwrap_err();
         assert!(err.to_string().contains("invalid UTF-8"), "{err}");
+    }
+
+    // --- A peer-declared length must never size an allocation, and a rejected
+    // frame must never leave the stream desynchronised (terminal-mcp#4). ---
+
+    thread_local! {
+        /// Largest single allocation requested on this thread while a probe is
+        /// armed, or `None` when none is. Scoping the measurement to one thread
+        /// and one armed window is what makes it a *per-test* signal: a shared
+        /// high-water mark would carry another test's allocations into this
+        /// one's assertion (and this one's into the next test that ran later).
+        ///
+        /// `const`-initialised so reading it never allocates and registers no
+        /// TLS destructor - otherwise recording an allocation could re-enter the
+        /// allocator.
+        static ALLOC_PROBE: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    fn record_alloc(size: usize) {
+        // `try_with` because an allocation can happen while thread-locals are
+        // being torn down, where `with` would panic.
+        let _ = ALLOC_PROBE.try_with(|probe| {
+            if let Some(largest) = probe.get() {
+                probe.set(Some(largest.max(size)));
+            }
+        });
+    }
+
+    /// Records the largest single allocation made on the current thread for as
+    /// long as it is alive, and stops on drop.
+    ///
+    /// Why a probe rather than a running total: `vec![0u8; n]` routes through
+    /// `alloc_zeroed`, so a body buffer sized from a declared Content-Length
+    /// shows up as one `n`-byte request even on a kernel that would lazily
+    /// overcommit it instead of failing. `#[tokio::test]` polls the test future
+    /// on the thread that armed the probe, so what it records is exactly the
+    /// allocations of the code under test.
+    struct AllocProbe;
+
+    impl AllocProbe {
+        fn arm() -> Self {
+            ALLOC_PROBE.with(|probe| probe.set(Some(0)));
+            Self
+        }
+
+        /// Largest single allocation seen since arming.
+        fn largest(&self) -> usize {
+            ALLOC_PROBE.with(|probe| probe.get().unwrap_or(0))
+        }
+    }
+
+    impl Drop for AllocProbe {
+        fn drop(&mut self) {
+            ALLOC_PROBE.with(|probe| probe.set(None));
+        }
+    }
+
+    /// Global allocator for the test binary: records the largest single request
+    /// while a probe is armed on the requesting thread, and delegates everything
+    /// to the system allocator.
+    struct MaxTrackingAlloc;
+
+    // SAFETY: every method forwards its unmodified `Layout` (and pointer, where
+    // applicable) to `std::alloc::System` and returns System's result unchanged,
+    // so this allocator inherits System's contract exactly. The only added work
+    // is a `Cell` update behind a `const`-initialised thread-local, which
+    // allocates nothing and cannot unwind, so no re-entrancy into the allocator
+    // is possible.
+    unsafe impl GlobalAlloc for MaxTrackingAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            record_alloc(layout.size());
+            // SAFETY: `layout` is the caller's, forwarded unchanged.
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            record_alloc(layout.size());
+            // SAFETY: `layout` is the caller's, forwarded unchanged.
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: `ptr` came from one of our methods, i.e. from System with
+            // this same `layout`; both are forwarded unchanged.
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            record_alloc(new_size);
+            // SAFETY: `ptr`/`layout` came from one of our methods (so from
+            // System), and `new_size` is the caller's; all forwarded unchanged.
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: MaxTrackingAlloc = MaxTrackingAlloc;
+
+    /// Nothing on the framing path legitimately allocates a block this large, so
+    /// a request above it inside an armed probe can only have come from trusting
+    /// a declared length.
+    const ALLOC_TRIPWIRE: usize = 256 * 1024 * 1024;
+
+    /// Assert that the code under test allocated nothing near a declared length.
+    ///
+    /// `largest == 0` means the probe recorded nothing at all - the reads it was
+    /// meant to watch happened somewhere it could not see - so it is a failure,
+    /// not a pass. Without that check the bound would be vacuous.
+    fn assert_no_declared_size_allocation(largest: usize, what: &str) {
+        assert!(
+            largest > 0,
+            "the allocation probe recorded nothing, so it proves nothing about {what}"
+        );
+        assert!(
+            largest < ALLOC_TRIPWIRE,
+            "{what} must not be sized from a declared length; \
+             largest single allocation was {largest} bytes"
+        );
+    }
+
+    /// Unwrap the framing-error message, matching on the error *variant* rather
+    /// than on its rendered text.
+    fn framing_error(err: &crate::error::Error) -> String {
+        match err {
+            crate::error::Error::Transport(TransportError::InvalidMessage(msg)) => msg.clone(),
+            other => panic!("expected TransportError::InvalidMessage, got {other:?}"),
+        }
+    }
+
+    /// Read one message, failing the test rather than hanging if the read does
+    /// not terminate (an unbounded read would otherwise wedge the harness).
+    async fn read_bounded<R, W>(t: &mut FramedTransport<R, W>) -> Result<String>
+    where
+        R: AsyncBufRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        tokio::time::timeout(std::time::Duration::from_secs(2), t.read_message())
+            .await
+            .expect("read_message must terminate promptly")
+    }
+
+    /// Assert that the transport is poisoned: the next reads neither return a
+    /// message nor merely run out of input, but say the stream was
+    /// desynchronised. Several attempts, because one refusal could be a
+    /// coincidence of where the input happened to end.
+    async fn assert_poisoned<R, W>(t: &mut FramedTransport<R, W>)
+    where
+        R: AsyncBufRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        for attempt in 0..3 {
+            match read_bounded(t).await {
+                Ok(msg) => panic!("read {attempt} after a refused frame returned a message: {msg}"),
+                Err(err) => {
+                    let reason = framing_error(&err);
+                    assert!(
+                        reason.contains("desynchronised"),
+                        "read {attempt} must report the poisoned stream, got: {reason}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The allocation probe has to be believable before any bound can rest on
+    /// it: armed, it sees a large single allocation made on its own thread.
+    #[test]
+    fn alloc_probe_records_the_largest_allocation_on_its_own_thread() {
+        const BIG: usize = 16 * 1024 * 1024;
+        let probe = AllocProbe::arm();
+        let buf = std::hint::black_box(vec![0u8; BIG]);
+        let largest = probe.largest();
+        drop(buf);
+        assert!(
+            largest >= BIG,
+            "probe must observe a {BIG}-byte allocation, saw {largest}"
+        );
+    }
+
+    /// And unarmed it records nothing, so one test's allocations can never be
+    /// read as another's.
+    #[test]
+    fn alloc_probe_records_nothing_once_dropped() {
+        const BIG: usize = 16 * 1024 * 1024;
+        drop(AllocProbe::arm());
+        drop(std::hint::black_box(vec![0u8; BIG]));
+        let probe = AllocProbe::arm();
+        let largest = probe.largest();
+        assert_eq!(largest, 0, "a dropped probe must stop recording");
+    }
+
+    /// Acceptance: an absurd declared length (~10 TB) is refused with an error
+    /// naming the cap, and nothing near that size is ever allocated.
+    #[tokio::test]
+    async fn absurd_content_length_is_rejected_without_allocating() {
+        let input = b"Content-Length: 9999999999999\r\n\r\n".to_vec();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 1024);
+        let probe = AllocProbe::arm();
+        let result = read_bounded(&mut t).await;
+        let largest = probe.largest();
+        drop(probe);
+        // Asserted before the outcome: sizing a buffer from the declaration is
+        // the failure this test exists to catch, so it must be what fails.
+        assert_no_declared_size_allocation(largest, "a refused frame");
+        let err = result.expect_err("an absurd declared length must not yield a message");
+        let msg = framing_error(&err);
+        assert!(msg.contains("9999999999999"), "must name the length: {msg}");
+        assert!(msg.contains("exceeds maximum"), "must name the cap: {msg}");
+    }
+
+    /// Acceptance: a declared length too large for `usize` is a framing
+    /// violation, not a header the parser quietly stops recognising — otherwise
+    /// framing silently degrades to newline mode and the frame body is handed
+    /// back to the caller as messages.
+    #[tokio::test]
+    async fn content_length_overflowing_usize_is_rejected() {
+        let input = b"Content-Length: 99999999999999999999999999999999\r\n\r\n{}".to_vec();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 1024);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("an out-of-range declared length must not yield a message");
+        let msg = framing_error(&err);
+        assert!(msg.contains("Content-Length"), "{msg}");
+    }
+
+    /// Acceptance: one byte over the cap is refused.
+    #[tokio::test]
+    async fn content_length_just_over_cap_is_rejected() {
+        const MAX: usize = 1024;
+        let input = format!("Content-Length: {}\r\n\r\n", MAX + 1).into_bytes();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), MAX);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("a length one byte over the cap must be refused");
+        let msg = framing_error(&err);
+        assert!(
+            msg.contains("1025") && msg.contains("1024"),
+            "must name both the length and the cap: {msg}"
+        );
+    }
+
+    /// Acceptance: one byte under the cap is accepted, body intact.
+    #[tokio::test]
+    async fn content_length_just_under_cap_is_accepted() {
+        const MAX: usize = 1024;
+        let body = "y".repeat(MAX - 1);
+        let input = format!("Content-Length: {}\r\n\r\n{body}", body.len()).into_bytes();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), MAX);
+        assert_eq!(
+            read_bounded(&mut t)
+                .await
+                .expect("a length under the cap must be accepted"),
+            body
+        );
+    }
+
+    /// Acceptance: exactly the cap is accepted — the bound is inclusive.
+    #[tokio::test]
+    async fn content_length_exactly_at_cap_is_accepted() {
+        const MAX: usize = 1024;
+        let body = "z".repeat(MAX);
+        let input = format!("Content-Length: {}\r\n\r\n{body}", body.len()).into_bytes();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), MAX);
+        assert_eq!(
+            read_bounded(&mut t)
+                .await
+                .expect("a length exactly at the cap must be accepted"),
+            body
+        );
+    }
+
+    /// Acceptance: a non-numeric length is a framing violation.
+    #[tokio::test]
+    async fn non_numeric_content_length_is_rejected() {
+        let input = b"Content-Length: not-a-number\r\n\r\n{}".to_vec();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 1024);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("a non-numeric length must not yield a message");
+        let msg = framing_error(&err);
+        assert!(msg.contains("Content-Length"), "{msg}");
+    }
+
+    /// Acceptance: a negative length is a framing violation (and never wraps).
+    #[tokio::test]
+    async fn negative_content_length_is_rejected() {
+        let input = b"Content-Length: -1\r\n\r\n{}".to_vec();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 1024);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("a negative length must not yield a message");
+        let msg = framing_error(&err);
+        assert!(msg.contains("Content-Length"), "{msg}");
+    }
+
+    /// Acceptance: an empty length is a framing violation.
+    #[tokio::test]
+    async fn empty_content_length_is_rejected() {
+        let input = b"Content-Length:\r\n\r\n{}".to_vec();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 1024);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("an empty length must not yield a message");
+        let msg = framing_error(&err);
+        assert!(msg.contains("Content-Length"), "{msg}");
+    }
+
+    /// Acceptance: a zero-length body is legal and yields an empty message.
+    #[tokio::test]
+    async fn zero_content_length_yields_empty_message() {
+        let input = b"Content-Length: 0\r\n\r\n".to_vec();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 1024);
+        assert_eq!(
+            read_bounded(&mut t)
+                .await
+                .expect("a zero-length body is well-framed"),
+            ""
+        );
+    }
+
+    /// Acceptance: the body buffer must track bytes actually delivered, not the
+    /// declared length — a peer that declares a cap-sized frame and then sends
+    /// ten bytes must not make the server reserve the whole cap.
+    ///
+    /// The cap here is deliberately above [`ALLOC_TRIPWIRE`] so that sizing the
+    /// buffer from the declaration trips the probe armed around the read.
+    #[tokio::test]
+    async fn body_allocation_tracks_delivered_bytes_not_declared_length() {
+        const MAX: usize = 512 * 1024 * 1024;
+        let input = format!("Content-Length: {MAX}\r\n\r\nshort").into_bytes();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), MAX);
+        let probe = AllocProbe::arm();
+        let result = read_bounded(&mut t).await;
+        let largest = probe.largest();
+        drop(probe);
+        // Asserted before the outcome: a buffer sized from the declaration is
+        // the failure this test exists to catch, so it must be what fails.
+        assert_no_declared_size_allocation(largest, "the body buffer");
+        let err = result.expect_err("a body shorter than declared is not a message");
+        let msg = framing_error(&err);
+        assert!(
+            msg.contains("body") && msg.contains("5"),
+            "must say how much of the body arrived: {msg}"
+        );
+    }
+
+    /// Acceptance: the refusal quotes at most a snippet of the declared value.
+    /// A declared length is peer text and can be padded with leading zeros to
+    /// any length the cap allows, and the refusal travels into logs and back to
+    /// the peer — it must not carry kilobytes of someone else's bytes with it.
+    #[tokio::test]
+    async fn oversize_content_length_error_truncates_the_declared_value() {
+        const MAX: usize = 8192;
+        let padded = format!("{}{}", "0".repeat(4096), MAX + 1);
+        let input = format!("Content-Length: {padded}\r\n\r\n").into_bytes();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), MAX);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("a padded oversize length must still be refused");
+        let msg = framing_error(&err);
+        assert!(msg.contains("exceeds maximum"), "{msg}");
+        assert!(
+            msg.len() < 256,
+            "refusal must not echo the padding ({} bytes): {msg}",
+            msg.len()
+        );
+    }
+
+    /// Acceptance: a flood of header lines is refused. Each line is individually
+    /// bounded, but the header loop itself must be bounded too, so one frame
+    /// cannot cost unbounded work.
+    #[tokio::test]
+    async fn frame_with_header_flood_is_rejected() {
+        let mut input = String::from("Content-Length: 2\r\n");
+        for i in 0..1000 {
+            input.push_str(&format!("X-Pad-{i}: pad\r\n"));
+        }
+        input.push_str("\r\n{}");
+        let mut t = FramedTransport::new(BufReader::new(input.as_bytes()), Vec::new(), 1024);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("a header flood must not yield a message");
+        let msg = framing_error(&err);
+        assert!(msg.contains("header"), "must name the header limit: {msg}");
+    }
+
+    /// Acceptance: a frame hidden behind a refused one is never dispatched. The
+    /// refused body was never consumed, so where the next frame starts is
+    /// unknown and every later read has to fail rather than parse peer-placed
+    /// bytes.
+    #[tokio::test]
+    async fn refused_oversize_content_length_is_not_followed_by_a_smuggled_message() {
+        let smuggled = r#"{"jsonrpc":"2.0","id":1,"method":"smuggled"}"#;
+        let input = format!(
+            "Content-Length: 9999999999\r\n\r\nContent-Length: {}\r\n\r\n{smuggled}",
+            smuggled.len()
+        )
+        .into_bytes();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 1024);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("the oversize frame must be refused");
+        assert!(framing_error(&err).contains("exceeds maximum"));
+        assert_poisoned(&mut t).await;
+    }
+
+    /// Acceptance: the same holds for newline framing. Only `max_len + 1` bytes
+    /// of the oversize line were consumed, so the rest of that line - and
+    /// anything a peer hid behind it - must not come back as a message.
+    #[tokio::test]
+    async fn refused_oversize_line_is_not_followed_by_a_smuggled_message() {
+        const MAX: usize = 1024;
+        let smuggled = r#"{"jsonrpc":"2.0","id":1,"method":"smuggled"}"#;
+        // Exactly `MAX + 1` newline-free bytes: the read stops right at the cap,
+        // leaving the newline and the following line in the stream.
+        let mut input = vec![b'x'; MAX + 1];
+        input.push(b'\n');
+        input.extend_from_slice(smuggled.as_bytes());
+        input.push(b'\n');
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), MAX);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("the oversize line must be refused");
+        assert!(framing_error(&err).contains("exceeds maximum"));
+        assert_poisoned(&mut t).await;
+    }
+
+    // --- A frame abandoned part-way through is as unrecoverable as one that was
+    // refused outright: the reader is inside a frame whose declared body has not
+    // been consumed, so the next frame boundary is unknown either way. ---
+
+    /// One step of a [`ScriptedReader`]: bytes to deliver, or an io failure to
+    /// raise at that point in the stream.
+    enum Step {
+        Bytes(Vec<u8>),
+        Fail(std::io::ErrorKind, &'static str),
+    }
+
+    /// A reader that plays a fixed script, so a test can place a failure exactly
+    /// where it needs one - part-way through a frame body, which a slice-backed
+    /// reader can never do.
+    struct ScriptedReader {
+        steps: std::collections::VecDeque<Step>,
+    }
+
+    impl ScriptedReader {
+        fn new(steps: Vec<Step>) -> Self {
+            Self {
+                steps: steps.into(),
+            }
+        }
+    }
+
+    impl tokio::io::AsyncRead for ScriptedReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            match self.steps.pop_front() {
+                // Script exhausted: clean EOF.
+                None => std::task::Poll::Ready(Ok(())),
+                Some(Step::Bytes(bytes)) => {
+                    assert!(
+                        buf.remaining() > 0,
+                        "the script still has bytes but the caller offered no room; \
+                         a zero-byte read would be mistaken for EOF"
+                    );
+                    let n = buf.remaining().min(bytes.len());
+                    buf.put_slice(&bytes[..n]);
+                    if n < bytes.len() {
+                        self.steps.push_front(Step::Bytes(bytes[n..].to_vec()));
+                    }
+                    std::task::Poll::Ready(Ok(()))
+                }
+                Some(Step::Fail(kind, msg)) => {
+                    std::task::Poll::Ready(Err(std::io::Error::new(kind, msg)))
+                }
+            }
+        }
+    }
+
+    /// Acceptance: a header line that is not UTF-8 poisons the stream. The
+    /// frame's declared body has not been consumed, so a peer can otherwise use
+    /// an undecodable header to drop the reader mid-frame and have the frame it
+    /// placed behind it dispatched on the next read.
+    #[tokio::test]
+    async fn invalid_utf8_header_line_is_not_followed_by_a_smuggled_message() {
+        let smuggled = r#"{"jsonrpc":"2.0","id":1,"method":"smuggled"}"#;
+        let mut input = b"Content-Length: 5\r\nX-Bad: \xff\r\n".to_vec();
+        input.extend_from_slice(
+            format!("Content-Length: {}\r\n\r\n{smuggled}", smuggled.len()).as_bytes(),
+        );
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 1024);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("a header line that is not UTF-8 is not a message");
+        assert!(
+            framing_error(&err).contains("invalid UTF-8"),
+            "the caller must learn why the frame was dropped: {err}"
+        );
+        assert_poisoned(&mut t).await;
+    }
+
+    /// Acceptance: the same holds for the line that opens a frame once
+    /// Content-Length framing is locked in. A first line the reader cannot
+    /// decode says no more about where the frame ends than a first line that is
+    /// not a Content-Length header - and that is already refused.
+    #[tokio::test]
+    async fn invalid_utf8_frame_start_is_not_followed_by_a_smuggled_message() {
+        let smuggled = r#"{"jsonrpc":"2.0","id":1,"method":"smuggled"}"#;
+        let mut input = b"Content-Length: 2\r\n\r\n{}".to_vec();
+        input.extend_from_slice(b"\xffContent-Length: 5\r\n");
+        input.extend_from_slice(
+            format!("Content-Length: {}\r\n\r\n{smuggled}", smuggled.len()).as_bytes(),
+        );
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 1024);
+        assert_eq!(
+            read_bounded(&mut t)
+                .await
+                .expect("the first frame is well formed"),
+            "{}"
+        );
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("a frame opening with an undecodable line is not a message");
+        assert!(
+            framing_error(&err).contains("invalid UTF-8"),
+            "the caller must learn why the frame was dropped: {err}"
+        );
+        assert_poisoned(&mut t).await;
+    }
+
+    /// Acceptance: an io failure part-way through a declared body poisons the
+    /// stream. Only some of the declared bytes were consumed, so the reader sits
+    /// inside a frame; reading on would dispatch whatever the peer put next.
+    /// `read_to_end` does not retry `Interrupted`, so a signal-interrupted read
+    /// reaches this path on a real socket.
+    #[tokio::test]
+    async fn io_error_mid_body_is_not_followed_by_a_smuggled_message() {
+        let smuggled = r#"{"jsonrpc":"2.0","id":1,"method":"smuggled"}"#;
+        let reader = ScriptedReader::new(vec![
+            Step::Bytes(b"Content-Length: 20\r\n\r\n".to_vec()),
+            Step::Bytes(b"12345".to_vec()),
+            Step::Fail(std::io::ErrorKind::Interrupted, "transient"),
+            Step::Bytes(
+                format!("Content-Length: {}\r\n\r\n{smuggled}", smuggled.len()).into_bytes(),
+            ),
+        ]);
+        let mut t = FramedTransport::new(BufReader::new(reader), Vec::new(), 1024);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("a body cut short by an io failure is not a message");
+        assert!(
+            matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::Interrupted),
+            "an io failure must reach the caller as itself, not as a framing verdict: {err:?}"
+        );
+        assert_poisoned(&mut t).await;
+    }
+
+    /// The deliberate exception, pinned so it is not lost: a body that is not
+    /// UTF-8 was nonetheless consumed in full, so framing is intact and the next
+    /// frame reads normally. Only a frame abandoned part-way through poisons.
+    #[tokio::test]
+    async fn invalid_utf8_body_leaves_the_stream_in_sync() {
+        let next = r#"{"jsonrpc":"2.0","id":1,"method":"next"}"#;
+        let mut input = b"Content-Length: 2\r\n\r\n\xff\xfe".to_vec();
+        input.extend_from_slice(format!("Content-Length: {}\r\n\r\n{next}", next.len()).as_bytes());
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 1024);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("a body that is not UTF-8 is not a message");
+        assert!(framing_error(&err).contains("invalid UTF-8"), "{err}");
+        assert_eq!(
+            read_bounded(&mut t)
+                .await
+                .expect("the frame after it is still readable"),
+            next
+        );
+    }
+
+    /// And the same exception in newline framing: the line was consumed up to
+    /// its newline, so the line after it is still a message.
+    #[tokio::test]
+    async fn invalid_utf8_line_leaves_the_stream_in_sync() {
+        let input = b"\xff\xfe\n{\"a\":1}\n".to_vec();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 64);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("a line that is not UTF-8 is not a message");
+        assert!(framing_error(&err).contains("invalid UTF-8"), "{err}");
+        assert_eq!(
+            read_bounded(&mut t)
+                .await
+                .expect("the line after it is still a message"),
+            "{\"a\":1}"
+        );
     }
 }

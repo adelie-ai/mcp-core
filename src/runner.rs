@@ -75,7 +75,23 @@ where
             // MC-4: a genuine read error (malformed framing, an oversize frame)
             // must propagate so the caller can exit non-zero — not be swallowed
             // as a clean shutdown, which would make the server silently go dark.
-            Err(e) => return Err(e),
+            Err(e) => {
+                // A framing violation ends the connection: the transport can no
+                // longer say where the next frame starts. Say so in the protocol
+                // first, best effort, so the peer gets a reason instead of a
+                // stream that just stops.
+                if let Error::Transport(TransportError::InvalidMessage(reason)) = &e {
+                    let resp = error_response(
+                        None,
+                        code::PARSE_ERROR,
+                        &format!("framing error: {reason}"),
+                    );
+                    if let Ok(text) = serde_json::to_string(&resp) {
+                        let _ = transport.write_message(&text).await;
+                    }
+                }
+                return Err(e);
+            }
         };
         if raw.trim().is_empty() {
             continue;
@@ -452,6 +468,34 @@ mod tests {
         assert!(
             matches!(result, Err(Error::Transport(_))),
             "oversize frame must propagate as Err, got {result:?}"
+        );
+    }
+
+    /// Acceptance: an oversize declared length is answered with a JSON-RPC
+    /// protocol error naming the cap before the pump gives up, so the peer
+    /// learns why the connection ended instead of seeing it drop silently.
+    #[tokio::test]
+    async fn pump_reports_framing_violation_to_peer_before_exiting() {
+        let input = b"Content-Length: 9999999999\r\n\r\n".to_vec();
+        let mut out: Vec<u8> = Vec::new();
+        let mut transport = FramedTransport::new(BufReader::new(&input[..]), &mut out, 1024);
+        let mut session = Session::new(core_capped(1024));
+        let result = pump(&mut transport, &mut session).await;
+        assert!(
+            matches!(
+                result,
+                Err(Error::Transport(TransportError::InvalidMessage(_)))
+            ),
+            "an oversize frame must still propagate as Err, got {result:?}"
+        );
+        let text = String::from_utf8(out).expect("responses are UTF-8");
+        assert!(
+            text.contains(&code::PARSE_ERROR.to_string()),
+            "expected a JSON-RPC protocol error for the peer: {text}"
+        );
+        assert!(
+            text.contains("exceeds maximum"),
+            "the error must say what was wrong: {text}"
         );
     }
 
