@@ -536,6 +536,52 @@ mod tests {
         );
     }
 
+    /// Acceptance: the body buffer must track bytes actually delivered, not the
+    /// declared length — a peer that declares a cap-sized frame and then sends
+    /// ten bytes must not make the server reserve the whole cap.
+    ///
+    /// The cap here is deliberately above [`ALLOC_TRIPWIRE`] so that sizing the
+    /// buffer from the declaration would trip it. `LARGEST_ALLOC` is shared by
+    /// the whole test binary, so a regression here also fails
+    /// `absurd_content_length_is_rejected_without_allocating`.
+    #[tokio::test]
+    async fn body_allocation_tracks_delivered_bytes_not_declared_length() {
+        const MAX: usize = 512 * 1024 * 1024;
+        let input = format!("Content-Length: {MAX}\r\n\r\nshort").into_bytes();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), MAX);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("a body shorter than declared is not a message");
+        let msg = framing_error(&err);
+        assert!(
+            msg.contains("body") && msg.contains("5"),
+            "must say how much of the body arrived: {msg}"
+        );
+        let largest = LARGEST_ALLOC.load(Ordering::Relaxed);
+        assert!(
+            largest < ALLOC_TRIPWIRE,
+            "the body buffer must follow delivered bytes; largest allocation was {largest} bytes"
+        );
+    }
+
+    /// Acceptance: a flood of header lines is refused. Each line is individually
+    /// bounded, but the header loop itself must be bounded too, so one frame
+    /// cannot cost unbounded work.
+    #[tokio::test]
+    async fn frame_with_header_flood_is_rejected() {
+        let mut input = String::from("Content-Length: 2\r\n");
+        for i in 0..1000 {
+            input.push_str(&format!("X-Pad-{i}: pad\r\n"));
+        }
+        input.push_str("\r\n{}");
+        let mut t = FramedTransport::new(BufReader::new(input.as_bytes()), Vec::new(), 1024);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("a header flood must not yield a message");
+        let msg = framing_error(&err);
+        assert!(msg.contains("header"), "must name the header limit: {msg}");
+    }
+
     /// Acceptance: refusing an oversize frame must not desynchronise the stream.
     /// The refused body was never consumed, so its bytes are not messages — a
     /// peer must not be able to smuggle a frame in behind a rejected header.
