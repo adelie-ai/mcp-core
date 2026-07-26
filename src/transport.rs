@@ -193,6 +193,9 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
 
     #[test]
@@ -325,5 +328,259 @@ mod tests {
         let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 64);
         let err = t.read_message().await.unwrap_err();
         assert!(err.to_string().contains("invalid UTF-8"), "{err}");
+    }
+
+    // --- A peer-declared length must never size an allocation, and a rejected
+    // frame must never leave the stream desynchronised (terminal-mcp#4). ---
+
+    /// Largest single allocation the test binary has requested. `vec![0u8; n]`
+    /// routes through `alloc_zeroed`, so a body buffer sized from a declared
+    /// Content-Length shows up here as an `n`-byte request even on a kernel that
+    /// would lazily overcommit it instead of failing.
+    static LARGEST_ALLOC: AtomicUsize = AtomicUsize::new(0);
+
+    fn record_alloc(size: usize) {
+        LARGEST_ALLOC.fetch_max(size, Ordering::Relaxed);
+    }
+
+    /// Global allocator for the test binary: records the largest single request
+    /// and delegates everything to the system allocator.
+    struct MaxTrackingAlloc;
+
+    // SAFETY: every method forwards its unmodified `Layout` (and pointer, where
+    // applicable) to `std::alloc::System` and returns System's result unchanged,
+    // so this allocator inherits System's contract exactly. The only added work
+    // is a relaxed atomic max, which allocates nothing and cannot unwind, so no
+    // re-entrancy into the allocator is possible.
+    unsafe impl GlobalAlloc for MaxTrackingAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            record_alloc(layout.size());
+            // SAFETY: `layout` is the caller's, forwarded unchanged.
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            record_alloc(layout.size());
+            // SAFETY: `layout` is the caller's, forwarded unchanged.
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            // SAFETY: `ptr` came from one of our methods, i.e. from System with
+            // this same `layout`; both are forwarded unchanged.
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            record_alloc(new_size);
+            // SAFETY: `ptr`/`layout` came from one of our methods (so from
+            // System), and `new_size` is the caller's; all forwarded unchanged.
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    #[global_allocator]
+    static ALLOCATOR: MaxTrackingAlloc = MaxTrackingAlloc;
+
+    /// No test in this binary legitimately allocates a block this large, so any
+    /// request above it can only have come from trusting a declared length.
+    const ALLOC_TRIPWIRE: usize = 256 * 1024 * 1024;
+
+    /// Unwrap the framing-error message, matching on the error *variant* rather
+    /// than on its rendered text.
+    fn framing_error(err: &crate::error::Error) -> String {
+        match err {
+            crate::error::Error::Transport(TransportError::InvalidMessage(msg)) => msg.clone(),
+            other => panic!("expected TransportError::InvalidMessage, got {other:?}"),
+        }
+    }
+
+    /// Read one message, failing the test rather than hanging if the read does
+    /// not terminate (an unbounded read would otherwise wedge the harness).
+    async fn read_bounded<R, W>(t: &mut FramedTransport<R, W>) -> Result<String>
+    where
+        R: AsyncBufRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        tokio::time::timeout(std::time::Duration::from_secs(2), t.read_message())
+            .await
+            .expect("read_message must terminate promptly")
+    }
+
+    /// Acceptance: an absurd declared length (~10 TB) is refused with an error
+    /// naming the cap, and nothing near that size is ever allocated.
+    #[tokio::test]
+    async fn absurd_content_length_is_rejected_without_allocating() {
+        let input = b"Content-Length: 9999999999999\r\n\r\n".to_vec();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 1024);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("an absurd declared length must not yield a message");
+        let msg = framing_error(&err);
+        assert!(msg.contains("9999999999999"), "must name the length: {msg}");
+        assert!(msg.contains("exceeds maximum"), "must name the cap: {msg}");
+        let largest = LARGEST_ALLOC.load(Ordering::Relaxed);
+        assert!(
+            largest < ALLOC_TRIPWIRE,
+            "a declared length must never size an allocation; largest was {largest} bytes"
+        );
+    }
+
+    /// Acceptance: a declared length too large for `usize` is a framing
+    /// violation, not a header the parser quietly stops recognising — otherwise
+    /// framing silently degrades to newline mode and the frame body is handed
+    /// back to the caller as messages.
+    #[tokio::test]
+    async fn content_length_overflowing_usize_is_rejected() {
+        let input = b"Content-Length: 99999999999999999999999999999999\r\n\r\n{}".to_vec();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 1024);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("an out-of-range declared length must not yield a message");
+        let msg = framing_error(&err);
+        assert!(msg.contains("Content-Length"), "{msg}");
+    }
+
+    /// Acceptance: one byte over the cap is refused.
+    #[tokio::test]
+    async fn content_length_just_over_cap_is_rejected() {
+        const MAX: usize = 1024;
+        let input = format!("Content-Length: {}\r\n\r\n", MAX + 1).into_bytes();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), MAX);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("a length one byte over the cap must be refused");
+        let msg = framing_error(&err);
+        assert!(
+            msg.contains("1025") && msg.contains("1024"),
+            "must name both the length and the cap: {msg}"
+        );
+    }
+
+    /// Acceptance: one byte under the cap is accepted, body intact.
+    #[tokio::test]
+    async fn content_length_just_under_cap_is_accepted() {
+        const MAX: usize = 1024;
+        let body = "y".repeat(MAX - 1);
+        let input = format!("Content-Length: {}\r\n\r\n{body}", body.len()).into_bytes();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), MAX);
+        assert_eq!(
+            read_bounded(&mut t)
+                .await
+                .expect("a length under the cap must be accepted"),
+            body
+        );
+    }
+
+    /// Acceptance: exactly the cap is accepted — the bound is inclusive.
+    #[tokio::test]
+    async fn content_length_exactly_at_cap_is_accepted() {
+        const MAX: usize = 1024;
+        let body = "z".repeat(MAX);
+        let input = format!("Content-Length: {}\r\n\r\n{body}", body.len()).into_bytes();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), MAX);
+        assert_eq!(
+            read_bounded(&mut t)
+                .await
+                .expect("a length exactly at the cap must be accepted"),
+            body
+        );
+    }
+
+    /// Acceptance: a non-numeric length is a framing violation.
+    #[tokio::test]
+    async fn non_numeric_content_length_is_rejected() {
+        let input = b"Content-Length: not-a-number\r\n\r\n{}".to_vec();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 1024);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("a non-numeric length must not yield a message");
+        let msg = framing_error(&err);
+        assert!(msg.contains("Content-Length"), "{msg}");
+    }
+
+    /// Acceptance: a negative length is a framing violation (and never wraps).
+    #[tokio::test]
+    async fn negative_content_length_is_rejected() {
+        let input = b"Content-Length: -1\r\n\r\n{}".to_vec();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 1024);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("a negative length must not yield a message");
+        let msg = framing_error(&err);
+        assert!(msg.contains("Content-Length"), "{msg}");
+    }
+
+    /// Acceptance: an empty length is a framing violation.
+    #[tokio::test]
+    async fn empty_content_length_is_rejected() {
+        let input = b"Content-Length:\r\n\r\n{}".to_vec();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 1024);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("an empty length must not yield a message");
+        let msg = framing_error(&err);
+        assert!(msg.contains("Content-Length"), "{msg}");
+    }
+
+    /// Acceptance: a zero-length body is legal and yields an empty message.
+    #[tokio::test]
+    async fn zero_content_length_yields_empty_message() {
+        let input = b"Content-Length: 0\r\n\r\n".to_vec();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 1024);
+        assert_eq!(
+            read_bounded(&mut t)
+                .await
+                .expect("a zero-length body is well-framed"),
+            ""
+        );
+    }
+
+    /// Acceptance: refusing an oversize frame must not desynchronise the stream.
+    /// The refused body was never consumed, so its bytes are not messages — a
+    /// peer must not be able to smuggle a frame in behind a rejected header.
+    #[tokio::test]
+    async fn rejected_oversize_content_length_does_not_desynchronise_stream() {
+        let smuggled = r#"{"jsonrpc":"2.0","id":1,"method":"smuggled"}"#;
+        let input = format!(
+            "Content-Length: 9999999999\r\n\r\nContent-Length: {}\r\n\r\n{smuggled}",
+            smuggled.len()
+        )
+        .into_bytes();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 1024);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("the oversize frame must be refused");
+        assert!(framing_error(&err).contains("exceeds maximum"));
+        for attempt in 0..3 {
+            if let Ok(msg) = read_bounded(&mut t).await {
+                panic!("read {attempt} after a refused frame returned a message: {msg}");
+            }
+        }
+    }
+
+    /// Acceptance: the same holds for newline framing. Only `max_len + 1` bytes
+    /// of the oversize line were consumed, so the rest of that line - and
+    /// anything a peer hid behind it - must not come back as a message.
+    #[tokio::test]
+    async fn rejected_oversize_line_does_not_desynchronise_stream() {
+        const MAX: usize = 1024;
+        let smuggled = r#"{"jsonrpc":"2.0","id":1,"method":"smuggled"}"#;
+        // Exactly `MAX + 1` newline-free bytes: the read stops right at the cap,
+        // leaving the newline and the following line in the stream.
+        let mut input = vec![b'x'; MAX + 1];
+        input.push(b'\n');
+        input.extend_from_slice(smuggled.as_bytes());
+        input.push(b'\n');
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), MAX);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("the oversize line must be refused");
+        assert!(framing_error(&err).contains("exceeds maximum"));
+        for attempt in 0..3 {
+            if let Ok(msg) = read_bounded(&mut t).await {
+                panic!("read {attempt} after a refused line returned a message: {msg}");
+            }
+        }
     }
 }

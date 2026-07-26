@@ -455,6 +455,34 @@ mod tests {
         );
     }
 
+    /// Acceptance: an oversize declared length is answered with a JSON-RPC
+    /// protocol error naming the cap before the pump gives up, so the peer
+    /// learns why the connection ended instead of seeing it drop silently.
+    #[tokio::test]
+    async fn pump_reports_framing_violation_to_peer_before_exiting() {
+        let input = b"Content-Length: 9999999999\r\n\r\n".to_vec();
+        let mut out: Vec<u8> = Vec::new();
+        let mut transport = FramedTransport::new(BufReader::new(&input[..]), &mut out, 1024);
+        let mut session = Session::new(core_capped(1024));
+        let result = pump(&mut transport, &mut session).await;
+        assert!(
+            matches!(
+                result,
+                Err(Error::Transport(TransportError::InvalidMessage(_)))
+            ),
+            "an oversize frame must still propagate as Err, got {result:?}"
+        );
+        let text = String::from_utf8(out).expect("responses are UTF-8");
+        assert!(
+            text.contains(&code::PARSE_ERROR.to_string()),
+            "expected a JSON-RPC protocol error for the peer: {text}"
+        );
+        assert!(
+            text.contains("exceeds maximum"),
+            "the error must say what was wrong: {text}"
+        );
+    }
+
     /// A malformed JSON line is recoverable: the pump writes a PARSE_ERROR
     /// response and keeps going to a clean EOF (Ok).
     #[tokio::test]
