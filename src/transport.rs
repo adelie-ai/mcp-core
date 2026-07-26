@@ -324,7 +324,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::alloc::{GlobalAlloc, Layout, System};
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::cell::Cell;
 
     use super::*;
 
@@ -464,25 +464,69 @@ mod tests {
     // --- A peer-declared length must never size an allocation, and a rejected
     // frame must never leave the stream desynchronised (terminal-mcp#4). ---
 
-    /// Largest single allocation the test binary has requested. `vec![0u8; n]`
-    /// routes through `alloc_zeroed`, so a body buffer sized from a declared
-    /// Content-Length shows up here as an `n`-byte request even on a kernel that
-    /// would lazily overcommit it instead of failing.
-    static LARGEST_ALLOC: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        /// Largest single allocation requested on this thread while a probe is
+        /// armed, or `None` when none is. Scoping the measurement to one thread
+        /// and one armed window is what makes it a *per-test* signal: a shared
+        /// high-water mark would carry another test's allocations into this
+        /// one's assertion (and this one's into the next test that ran later).
+        ///
+        /// `const`-initialised so reading it never allocates and registers no
+        /// TLS destructor - otherwise recording an allocation could re-enter the
+        /// allocator.
+        static ALLOC_PROBE: Cell<Option<usize>> = const { Cell::new(None) };
+    }
 
     fn record_alloc(size: usize) {
-        LARGEST_ALLOC.fetch_max(size, Ordering::Relaxed);
+        // `try_with` because an allocation can happen while thread-locals are
+        // being torn down, where `with` would panic.
+        let _ = ALLOC_PROBE.try_with(|probe| {
+            if let Some(largest) = probe.get() {
+                probe.set(Some(largest.max(size)));
+            }
+        });
+    }
+
+    /// Records the largest single allocation made on the current thread for as
+    /// long as it is alive, and stops on drop.
+    ///
+    /// Why a probe rather than a running total: `vec![0u8; n]` routes through
+    /// `alloc_zeroed`, so a body buffer sized from a declared Content-Length
+    /// shows up as one `n`-byte request even on a kernel that would lazily
+    /// overcommit it instead of failing. `#[tokio::test]` polls the test future
+    /// on the thread that armed the probe, so what it records is exactly the
+    /// allocations of the code under test.
+    struct AllocProbe;
+
+    impl AllocProbe {
+        fn arm() -> Self {
+            ALLOC_PROBE.with(|probe| probe.set(Some(0)));
+            Self
+        }
+
+        /// Largest single allocation seen since arming.
+        fn largest(&self) -> usize {
+            ALLOC_PROBE.with(|probe| probe.get().unwrap_or(0))
+        }
+    }
+
+    impl Drop for AllocProbe {
+        fn drop(&mut self) {
+            ALLOC_PROBE.with(|probe| probe.set(None));
+        }
     }
 
     /// Global allocator for the test binary: records the largest single request
-    /// and delegates everything to the system allocator.
+    /// while a probe is armed on the requesting thread, and delegates everything
+    /// to the system allocator.
     struct MaxTrackingAlloc;
 
     // SAFETY: every method forwards its unmodified `Layout` (and pointer, where
     // applicable) to `std::alloc::System` and returns System's result unchanged,
     // so this allocator inherits System's contract exactly. The only added work
-    // is a relaxed atomic max, which allocates nothing and cannot unwind, so no
-    // re-entrancy into the allocator is possible.
+    // is a `Cell` update behind a `const`-initialised thread-local, which
+    // allocates nothing and cannot unwind, so no re-entrancy into the allocator
+    // is possible.
     unsafe impl GlobalAlloc for MaxTrackingAlloc {
         unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
             record_alloc(layout.size());
@@ -513,9 +557,27 @@ mod tests {
     #[global_allocator]
     static ALLOCATOR: MaxTrackingAlloc = MaxTrackingAlloc;
 
-    /// No test in this binary legitimately allocates a block this large, so any
-    /// request above it can only have come from trusting a declared length.
+    /// Nothing on the framing path legitimately allocates a block this large, so
+    /// a request above it inside an armed probe can only have come from trusting
+    /// a declared length.
     const ALLOC_TRIPWIRE: usize = 256 * 1024 * 1024;
+
+    /// Assert that the code under test allocated nothing near a declared length.
+    ///
+    /// `largest == 0` means the probe recorded nothing at all - the reads it was
+    /// meant to watch happened somewhere it could not see - so it is a failure,
+    /// not a pass. Without that check the bound would be vacuous.
+    fn assert_no_declared_size_allocation(largest: usize, what: &str) {
+        assert!(
+            largest > 0,
+            "the allocation probe recorded nothing, so it proves nothing about {what}"
+        );
+        assert!(
+            largest < ALLOC_TRIPWIRE,
+            "{what} must not be sized from a declared length; \
+             largest single allocation was {largest} bytes"
+        );
+    }
 
     /// Unwrap the framing-error message, matching on the error *variant* rather
     /// than on its rendered text.
@@ -538,23 +600,73 @@ mod tests {
             .expect("read_message must terminate promptly")
     }
 
+    /// Assert that the transport is poisoned: the next reads neither return a
+    /// message nor merely run out of input, but say the stream was
+    /// desynchronised. Several attempts, because one refusal could be a
+    /// coincidence of where the input happened to end.
+    async fn assert_poisoned<R, W>(t: &mut FramedTransport<R, W>)
+    where
+        R: AsyncBufRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        for attempt in 0..3 {
+            match read_bounded(t).await {
+                Ok(msg) => panic!("read {attempt} after a refused frame returned a message: {msg}"),
+                Err(err) => {
+                    let reason = framing_error(&err);
+                    assert!(
+                        reason.contains("desynchronised"),
+                        "read {attempt} must report the poisoned stream, got: {reason}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The allocation probe has to be believable before any bound can rest on
+    /// it: armed, it sees a large single allocation made on its own thread.
+    #[test]
+    fn alloc_probe_records_the_largest_allocation_on_its_own_thread() {
+        const BIG: usize = 16 * 1024 * 1024;
+        let probe = AllocProbe::arm();
+        let buf = std::hint::black_box(vec![0u8; BIG]);
+        let largest = probe.largest();
+        drop(buf);
+        assert!(
+            largest >= BIG,
+            "probe must observe a {BIG}-byte allocation, saw {largest}"
+        );
+    }
+
+    /// And unarmed it records nothing, so one test's allocations can never be
+    /// read as another's.
+    #[test]
+    fn alloc_probe_records_nothing_once_dropped() {
+        const BIG: usize = 16 * 1024 * 1024;
+        drop(AllocProbe::arm());
+        drop(std::hint::black_box(vec![0u8; BIG]));
+        let probe = AllocProbe::arm();
+        let largest = probe.largest();
+        assert_eq!(largest, 0, "a dropped probe must stop recording");
+    }
+
     /// Acceptance: an absurd declared length (~10 TB) is refused with an error
     /// naming the cap, and nothing near that size is ever allocated.
     #[tokio::test]
     async fn absurd_content_length_is_rejected_without_allocating() {
         let input = b"Content-Length: 9999999999999\r\n\r\n".to_vec();
         let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 1024);
-        let err = read_bounded(&mut t)
-            .await
-            .expect_err("an absurd declared length must not yield a message");
+        let probe = AllocProbe::arm();
+        let result = read_bounded(&mut t).await;
+        let largest = probe.largest();
+        drop(probe);
+        // Asserted before the outcome: sizing a buffer from the declaration is
+        // the failure this test exists to catch, so it must be what fails.
+        assert_no_declared_size_allocation(largest, "a refused frame");
+        let err = result.expect_err("an absurd declared length must not yield a message");
         let msg = framing_error(&err);
         assert!(msg.contains("9999999999999"), "must name the length: {msg}");
         assert!(msg.contains("exceeds maximum"), "must name the cap: {msg}");
-        let largest = LARGEST_ALLOC.load(Ordering::Relaxed);
-        assert!(
-            largest < ALLOC_TRIPWIRE,
-            "a declared length must never size an allocation; largest was {largest} bytes"
-        );
     }
 
     /// Acceptance: a declared length too large for `usize` is a framing
@@ -672,26 +784,24 @@ mod tests {
     /// ten bytes must not make the server reserve the whole cap.
     ///
     /// The cap here is deliberately above [`ALLOC_TRIPWIRE`] so that sizing the
-    /// buffer from the declaration would trip it. `LARGEST_ALLOC` is shared by
-    /// the whole test binary, so a regression here also fails
-    /// `absurd_content_length_is_rejected_without_allocating`.
+    /// buffer from the declaration trips the probe armed around the read.
     #[tokio::test]
     async fn body_allocation_tracks_delivered_bytes_not_declared_length() {
         const MAX: usize = 512 * 1024 * 1024;
         let input = format!("Content-Length: {MAX}\r\n\r\nshort").into_bytes();
         let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), MAX);
-        let err = read_bounded(&mut t)
-            .await
-            .expect_err("a body shorter than declared is not a message");
+        let probe = AllocProbe::arm();
+        let result = read_bounded(&mut t).await;
+        let largest = probe.largest();
+        drop(probe);
+        // Asserted before the outcome: a buffer sized from the declaration is
+        // the failure this test exists to catch, so it must be what fails.
+        assert_no_declared_size_allocation(largest, "the body buffer");
+        let err = result.expect_err("a body shorter than declared is not a message");
         let msg = framing_error(&err);
         assert!(
             msg.contains("body") && msg.contains("5"),
             "must say how much of the body arrived: {msg}"
-        );
-        let largest = LARGEST_ALLOC.load(Ordering::Relaxed);
-        assert!(
-            largest < ALLOC_TRIPWIRE,
-            "the body buffer must follow delivered bytes; largest allocation was {largest} bytes"
         );
     }
 
@@ -735,11 +845,12 @@ mod tests {
         assert!(msg.contains("header"), "must name the header limit: {msg}");
     }
 
-    /// Acceptance: refusing an oversize frame must not desynchronise the stream.
-    /// The refused body was never consumed, so its bytes are not messages — a
-    /// peer must not be able to smuggle a frame in behind a rejected header.
+    /// Acceptance: a frame hidden behind a refused one is never dispatched. The
+    /// refused body was never consumed, so where the next frame starts is
+    /// unknown and every later read has to fail rather than parse peer-placed
+    /// bytes.
     #[tokio::test]
-    async fn rejected_oversize_content_length_does_not_desynchronise_stream() {
+    async fn refused_oversize_content_length_is_not_followed_by_a_smuggled_message() {
         let smuggled = r#"{"jsonrpc":"2.0","id":1,"method":"smuggled"}"#;
         let input = format!(
             "Content-Length: 9999999999\r\n\r\nContent-Length: {}\r\n\r\n{smuggled}",
@@ -751,18 +862,14 @@ mod tests {
             .await
             .expect_err("the oversize frame must be refused");
         assert!(framing_error(&err).contains("exceeds maximum"));
-        for attempt in 0..3 {
-            if let Ok(msg) = read_bounded(&mut t).await {
-                panic!("read {attempt} after a refused frame returned a message: {msg}");
-            }
-        }
+        assert_poisoned(&mut t).await;
     }
 
     /// Acceptance: the same holds for newline framing. Only `max_len + 1` bytes
     /// of the oversize line were consumed, so the rest of that line - and
     /// anything a peer hid behind it - must not come back as a message.
     #[tokio::test]
-    async fn rejected_oversize_line_does_not_desynchronise_stream() {
+    async fn refused_oversize_line_is_not_followed_by_a_smuggled_message() {
         const MAX: usize = 1024;
         let smuggled = r#"{"jsonrpc":"2.0","id":1,"method":"smuggled"}"#;
         // Exactly `MAX + 1` newline-free bytes: the read stops right at the cap,
@@ -776,10 +883,6 @@ mod tests {
             .await
             .expect_err("the oversize line must be refused");
         assert!(framing_error(&err).contains("exceeds maximum"));
-        for attempt in 0..3 {
-            if let Ok(msg) = read_bounded(&mut t).await {
-                panic!("read {attempt} after a refused line returned a message: {msg}");
-            }
-        }
+        assert_poisoned(&mut t).await;
     }
 }
