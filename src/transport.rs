@@ -885,4 +885,176 @@ mod tests {
         assert!(framing_error(&err).contains("exceeds maximum"));
         assert_poisoned(&mut t).await;
     }
+
+    // --- A frame abandoned part-way through is as unrecoverable as one that was
+    // refused outright: the reader is inside a frame whose declared body has not
+    // been consumed, so the next frame boundary is unknown either way. ---
+
+    /// One step of a [`ScriptedReader`]: bytes to deliver, or an io failure to
+    /// raise at that point in the stream.
+    enum Step {
+        Bytes(Vec<u8>),
+        Fail(std::io::ErrorKind, &'static str),
+    }
+
+    /// A reader that plays a fixed script, so a test can place a failure exactly
+    /// where it needs one - part-way through a frame body, which a slice-backed
+    /// reader can never do.
+    struct ScriptedReader {
+        steps: std::collections::VecDeque<Step>,
+    }
+
+    impl ScriptedReader {
+        fn new(steps: Vec<Step>) -> Self {
+            Self {
+                steps: steps.into(),
+            }
+        }
+    }
+
+    impl tokio::io::AsyncRead for ScriptedReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            match self.steps.pop_front() {
+                // Script exhausted: clean EOF.
+                None => std::task::Poll::Ready(Ok(())),
+                Some(Step::Bytes(bytes)) => {
+                    assert!(
+                        buf.remaining() > 0,
+                        "the script still has bytes but the caller offered no room; \
+                         a zero-byte read would be mistaken for EOF"
+                    );
+                    let n = buf.remaining().min(bytes.len());
+                    buf.put_slice(&bytes[..n]);
+                    if n < bytes.len() {
+                        self.steps.push_front(Step::Bytes(bytes[n..].to_vec()));
+                    }
+                    std::task::Poll::Ready(Ok(()))
+                }
+                Some(Step::Fail(kind, msg)) => {
+                    std::task::Poll::Ready(Err(std::io::Error::new(kind, msg)))
+                }
+            }
+        }
+    }
+
+    /// Acceptance: a header line that is not UTF-8 poisons the stream. The
+    /// frame's declared body has not been consumed, so a peer can otherwise use
+    /// an undecodable header to drop the reader mid-frame and have the frame it
+    /// placed behind it dispatched on the next read.
+    #[tokio::test]
+    async fn invalid_utf8_header_line_is_not_followed_by_a_smuggled_message() {
+        let smuggled = r#"{"jsonrpc":"2.0","id":1,"method":"smuggled"}"#;
+        let mut input = b"Content-Length: 5\r\nX-Bad: \xff\r\n".to_vec();
+        input.extend_from_slice(
+            format!("Content-Length: {}\r\n\r\n{smuggled}", smuggled.len()).as_bytes(),
+        );
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 1024);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("a header line that is not UTF-8 is not a message");
+        assert!(
+            framing_error(&err).contains("invalid UTF-8"),
+            "the caller must learn why the frame was dropped: {err}"
+        );
+        assert_poisoned(&mut t).await;
+    }
+
+    /// Acceptance: the same holds for the line that opens a frame once
+    /// Content-Length framing is locked in. A first line the reader cannot
+    /// decode says no more about where the frame ends than a first line that is
+    /// not a Content-Length header - and that is already refused.
+    #[tokio::test]
+    async fn invalid_utf8_frame_start_is_not_followed_by_a_smuggled_message() {
+        let smuggled = r#"{"jsonrpc":"2.0","id":1,"method":"smuggled"}"#;
+        let mut input = b"Content-Length: 2\r\n\r\n{}".to_vec();
+        input.extend_from_slice(b"\xffContent-Length: 5\r\n");
+        input.extend_from_slice(
+            format!("Content-Length: {}\r\n\r\n{smuggled}", smuggled.len()).as_bytes(),
+        );
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 1024);
+        assert_eq!(
+            read_bounded(&mut t)
+                .await
+                .expect("the first frame is well formed"),
+            "{}"
+        );
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("a frame opening with an undecodable line is not a message");
+        assert!(
+            framing_error(&err).contains("invalid UTF-8"),
+            "the caller must learn why the frame was dropped: {err}"
+        );
+        assert_poisoned(&mut t).await;
+    }
+
+    /// Acceptance: an io failure part-way through a declared body poisons the
+    /// stream. Only some of the declared bytes were consumed, so the reader sits
+    /// inside a frame; reading on would dispatch whatever the peer put next.
+    /// `read_to_end` does not retry `Interrupted`, so a signal-interrupted read
+    /// reaches this path on a real socket.
+    #[tokio::test]
+    async fn io_error_mid_body_is_not_followed_by_a_smuggled_message() {
+        let smuggled = r#"{"jsonrpc":"2.0","id":1,"method":"smuggled"}"#;
+        let reader = ScriptedReader::new(vec![
+            Step::Bytes(b"Content-Length: 20\r\n\r\n".to_vec()),
+            Step::Bytes(b"12345".to_vec()),
+            Step::Fail(std::io::ErrorKind::Interrupted, "transient"),
+            Step::Bytes(
+                format!("Content-Length: {}\r\n\r\n{smuggled}", smuggled.len()).into_bytes(),
+            ),
+        ]);
+        let mut t = FramedTransport::new(BufReader::new(reader), Vec::new(), 1024);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("a body cut short by an io failure is not a message");
+        assert!(
+            matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::Interrupted),
+            "an io failure must reach the caller as itself, not as a framing verdict: {err:?}"
+        );
+        assert_poisoned(&mut t).await;
+    }
+
+    /// The deliberate exception, pinned so it is not lost: a body that is not
+    /// UTF-8 was nonetheless consumed in full, so framing is intact and the next
+    /// frame reads normally. Only a frame abandoned part-way through poisons.
+    #[tokio::test]
+    async fn invalid_utf8_body_leaves_the_stream_in_sync() {
+        let next = r#"{"jsonrpc":"2.0","id":1,"method":"next"}"#;
+        let mut input = b"Content-Length: 2\r\n\r\n\xff\xfe".to_vec();
+        input.extend_from_slice(format!("Content-Length: {}\r\n\r\n{next}", next.len()).as_bytes());
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 1024);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("a body that is not UTF-8 is not a message");
+        assert!(framing_error(&err).contains("invalid UTF-8"), "{err}");
+        assert_eq!(
+            read_bounded(&mut t)
+                .await
+                .expect("the frame after it is still readable"),
+            next
+        );
+    }
+
+    /// And the same exception in newline framing: the line was consumed up to
+    /// its newline, so the line after it is still a message.
+    #[tokio::test]
+    async fn invalid_utf8_line_leaves_the_stream_in_sync() {
+        let input = b"\xff\xfe\n{\"a\":1}\n".to_vec();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), 64);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("a line that is not UTF-8 is not a message");
+        assert!(framing_error(&err).contains("invalid UTF-8"), "{err}");
+        assert_eq!(
+            read_bounded(&mut t)
+                .await
+                .expect("the line after it is still a message"),
+            "{\"a\":1}"
+        );
+    }
 }
