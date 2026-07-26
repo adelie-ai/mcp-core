@@ -13,11 +13,18 @@
 //! nor an endless newline-free line can exhaust memory. The header block is
 //! bounded too ([`MAX_HEADER_LINES`]), so one frame cannot cost unbounded reads.
 //!
-//! A refused frame ends the stream. Every violation is detected *before* the
-//! offending frame has been consumed, so the position of the next frame is
-//! unknowable; carrying on would let a peer hide a well-formed frame behind a
-//! refused one. The transport therefore marks itself desynchronised and every
-//! later read fails, leaving the caller to close the connection.
+//! A frame the transport does not finish reading ends the stream - whether it
+//! was refused outright (an oversize body is never read, an oversize line is
+//! abandoned mid-line) or given up on part-way through (an undecodable header,
+//! an io failure inside a declared body). Its remaining bytes stay in the
+//! stream, so the position of the next frame is unknowable, and carrying on
+//! would let a peer hide a well-formed frame behind the abandoned one. The
+//! transport therefore marks itself desynchronised and every later read fails,
+//! leaving the caller to close the connection.
+//!
+//! The one exception is a frame that *was* consumed in full and only then found
+//! unusable: a body - or a newline-delimited line - that is not UTF-8. Framing
+//! is intact there, so that read fails and the next one proceeds normally.
 
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Stdin,
@@ -48,6 +55,12 @@ const ERROR_ECHO_LIMIT: usize = 64;
 
 fn trim_crlf(s: &str) -> &str {
     s.trim_end_matches(['\r', '\n'])
+}
+
+/// Whether `err` is the peer closing the stream cleanly, as opposed to a frame
+/// going wrong. Matched on the variant, never on the rendered message.
+fn is_connection_closed(err: &Error) -> bool {
+    matches!(err, Error::Transport(TransportError::ConnectionClosed))
 }
 
 /// `s` shortened to [`ERROR_ECHO_LIMIT`] characters, marked when shortened.
@@ -124,16 +137,29 @@ where
 
     /// Record that framing has been lost, and build the error to return.
     ///
-    /// Why the transport stays refused: every violation we detect is refused
-    /// before its frame has been consumed - an oversize body is never read, an
-    /// oversize line is abandoned mid-line - so the next frame boundary is
-    /// unknown. The protocol offers no resynchronisation point, and reading on
-    /// regardless would let a peer hide a well-formed frame behind a refused one
-    /// and have it dispatched. The first reason is kept: later reads report the
-    /// original cause, not a cascade.
+    /// Why the transport stays refused: a frame we refuse is never consumed - an
+    /// oversize body is not read, an oversize line is abandoned mid-line - and
+    /// neither is a frame we give up on part-way through, so the next frame
+    /// boundary is unknown. The protocol offers no resynchronisation point, and
+    /// reading on regardless would let a peer hide a well-formed frame behind
+    /// the abandoned one and have it dispatched. The first reason is kept: later
+    /// reads report the original cause, not a cascade.
     fn desync_error(&mut self, reason: String) -> Error {
         let reason = self.desync.get_or_insert(reason);
         TransportError::InvalidMessage(reason.clone()).into()
+    }
+
+    /// Record that framing has been lost for `reason`, and hand `err` back
+    /// unchanged.
+    ///
+    /// Why not [`Self::desync_error`] everywhere: the stream is equally lost
+    /// whether the frame was malformed or our own read of it failed, but those
+    /// are different things to a caller - only the first is the peer's fault -
+    /// so the error keeps its own variant while the transport is poisoned all
+    /// the same.
+    fn poison(&mut self, reason: String, err: Error) -> Error {
+        self.desync.get_or_insert(reason);
+        err
     }
 
     /// Refuse `len` if it is past the cap. A violation is unrecoverable, so this
@@ -162,7 +188,7 @@ where
             Framing::Auto => self.read_auto().await,
             Framing::Newline => self.read_newline().await,
             Framing::ContentLength => {
-                let first = self.read_line().await?;
+                let first = self.read_frame_line().await?;
                 self.read_content_length(&first).await
             }
         }
@@ -222,6 +248,27 @@ where
         self.check_len(buf.len(), "line length")?;
         String::from_utf8(buf)
             .map_err(|e| TransportError::InvalidMessage(format!("invalid UTF-8: {e}")).into())
+    }
+
+    /// Read a line that belongs to a `Content-Length` frame - the line that
+    /// opens it, or one of its headers.
+    ///
+    /// Any failure other than a clean EOF leaves the reader inside a frame whose
+    /// declared body has not been consumed, so it poisons the transport
+    /// ([`Self::poison`]). Without that, an undecodable header is a
+    /// frame-smuggling primitive: the peer declares a body, makes the read fail
+    /// before it is consumed, and has the frame it placed behind it dispatched
+    /// on the next read. A clean EOF is left alone - the peer is gone, so there
+    /// is nothing left to mistake for a message.
+    async fn read_frame_line(&mut self) -> Result<String> {
+        match self.read_line().await {
+            Ok(line) => Ok(line),
+            Err(err) if is_connection_closed(&err) => Err(err),
+            Err(err) => {
+                let reason = format!("frame abandoned before its body was consumed: {err}");
+                Err(self.poison(reason, err))
+            }
+        }
     }
 
     async fn read_newline(&mut self) -> Result<String> {
@@ -289,7 +336,7 @@ where
         // frame cannot keep us reading headers indefinitely.
         let mut lines = 1;
         loop {
-            let line = self.read_line().await?;
+            let line = self.read_frame_line().await?;
             if trim_crlf(&line).is_empty() {
                 break;
             }
@@ -305,10 +352,20 @@ where
         // arrives, so a peer that declares the cap and sends five bytes costs
         // five bytes.
         let mut buf = Vec::new();
-        (&mut self.reader)
+        if let Err(err) = (&mut self.reader)
             .take(declared as u64)
             .read_to_end(&mut buf)
-            .await?;
+            .await
+        {
+            // Some of the declared body was consumed and the rest is unknown, so
+            // the stream is as lost as after a refused frame - but the cause is
+            // ours, not the peer's, so the caller still sees the io error.
+            let reason = format!(
+                "frame body read failed after {} of {declared} declared bytes: {err}",
+                buf.len()
+            );
+            return Err(self.poison(reason, err.into()));
+        }
         if buf.len() != declared {
             let reason = format!(
                 "frame body ended after {} of {declared} declared bytes",
