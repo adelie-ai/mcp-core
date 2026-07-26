@@ -2,18 +2,29 @@
 //!
 //! Supports both newline-delimited JSON and LSP-style
 //! `Content-Length: N\r\n\r\n<bytes>` framing, auto-detected from the first
-//! line. A configurable size cap (`max_len`) bounds memory in both modes:
-//! Content-Length is checked against the cap *before* the body buffer is
-//! allocated, and newline lines are read incrementally and rejected after at
-//! most `max_len + 1` bytes — so a peer can't trigger an OOM with a huge
-//! `Content-Length` *or* an endless newline-free line.
+//! line.
+//!
+//! Nothing a peer declares about a frame is trusted before it is checked. A
+//! configurable size cap (`max_len`) bounds memory in both modes: a declared
+//! `Content-Length` is range-checked against the cap before any body buffer
+//! exists and the body then grows with the bytes that actually arrive, while
+//! newline lines are read incrementally and rejected after at most
+//! `max_len + 1` bytes. So neither a huge `Content-Length`, nor a lie about one,
+//! nor an endless newline-free line can exhaust memory. The header block is
+//! bounded too ([`MAX_HEADER_LINES`]), so one frame cannot cost unbounded reads.
+//!
+//! A refused frame ends the stream. Every violation is detected *before* the
+//! offending frame has been consumed, so the position of the next frame is
+//! unknowable; carrying on would let a peer hide a well-formed frame behind a
+//! refused one. The transport therefore marks itself desynchronised and every
+//! later read fails, leaving the caller to close the connection.
 
 use tokio::io::{
     AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, Stdin,
     Stdout,
 };
 
-use crate::error::{Result, TransportError};
+use crate::error::{Error, Result, TransportError};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Framing {
@@ -22,16 +33,43 @@ enum Framing {
     ContentLength,
 }
 
+/// Upper bound on the header lines one `Content-Length` frame may carry.
+///
+/// Why: real peers send one or two (`Content-Length`, occasionally
+/// `Content-Type`). Each line is individually bounded by `max_len`, but the
+/// header block is not, so without a count a peer can keep a server reading
+/// headers for a single frame forever.
+pub const MAX_HEADER_LINES: usize = 64;
+
+/// Upper bound on the peer-supplied characters an error message echoes back.
+/// Enough to diagnose a bad header. Short enough that a refused frame cannot
+/// turn our error path into a carrier for the peer's own bytes.
+const ERROR_ECHO_LIMIT: usize = 64;
+
 fn trim_crlf(s: &str) -> &str {
     s.trim_end_matches(['\r', '\n'])
 }
 
-fn parse_content_length_header(line: &str) -> Option<usize> {
-    let (name, value) = trim_crlf(line).trim().split_once(':')?;
-    if !name.trim().eq_ignore_ascii_case("content-length") {
-        return None;
+/// `s` shortened to [`ERROR_ECHO_LIMIT`] characters, marked when shortened.
+fn for_error(s: &str) -> String {
+    match s.char_indices().nth(ERROR_ECHO_LIMIT) {
+        Some((end, _)) => format!("{}...", &s[..end]),
+        None => s.to_string(),
     }
-    value.trim().parse::<usize>().ok()
+}
+
+/// The raw value of `line` if it is a `Content-Length` header, else `None`.
+///
+/// Why recognition is split from parsing: a value that does not parse has to be
+/// a framing *error*, not an unrecognised header. Folding the two together made
+/// `Content-Length: 99999999999999999999999999` (too large for `usize`) look
+/// like an ordinary line, which silently downgraded the stream to newline
+/// framing and handed the frame's own body back to the caller as messages.
+fn content_length_value(line: &str) -> Option<&str> {
+    let (name, value) = trim_crlf(line).trim().split_once(':')?;
+    name.trim()
+        .eq_ignore_ascii_case("content-length")
+        .then(|| value.trim())
 }
 
 /// A framed transport over a buffered reader and a writer.
@@ -40,6 +78,9 @@ pub struct FramedTransport<R, W> {
     writer: W,
     framing: Framing,
     max_len: usize,
+    /// Why framing was lost, once it has been. Set by the first violation and
+    /// never cleared; while set, every read fails. See [`Self::desync_error`].
+    desync: Option<String>,
 }
 
 impl FramedTransport<BufReader<Stdin>, Stdout> {
@@ -65,23 +106,58 @@ where
             writer,
             framing: Framing::Auto,
             max_len,
+            desync: None,
         }
     }
 
-    fn check_len(&self, len: usize, what: &str) -> Result<()> {
+    /// Message for a length that is past the cap, phrased the same way wherever
+    /// the length came from. `shown` may be raw peer text (a declared value can
+    /// carry any number of leading zeros), so it is truncated here rather than at
+    /// each call site.
+    fn too_large(&self, what: &str, shown: &str) -> String {
+        format!(
+            "{what} {} exceeds maximum of {} bytes",
+            for_error(shown),
+            self.max_len
+        )
+    }
+
+    /// Record that framing has been lost, and build the error to return.
+    ///
+    /// Why the transport stays refused: every violation we detect is refused
+    /// before its frame has been consumed - an oversize body is never read, an
+    /// oversize line is abandoned mid-line - so the next frame boundary is
+    /// unknown. The protocol offers no resynchronisation point, and reading on
+    /// regardless would let a peer hide a well-formed frame behind a refused one
+    /// and have it dispatched. The first reason is kept: later reads report the
+    /// original cause, not a cascade.
+    fn desync_error(&mut self, reason: String) -> Error {
+        let reason = self.desync.get_or_insert(reason);
+        TransportError::InvalidMessage(reason.clone()).into()
+    }
+
+    /// Refuse `len` if it is past the cap. A violation is unrecoverable, so this
+    /// also desynchronises the transport ([`Self::desync_error`]).
+    fn check_len(&mut self, len: usize, what: &str) -> Result<()> {
         if len > self.max_len {
-            return Err(TransportError::InvalidMessage(format!(
-                "{what} {len} exceeds maximum of {} bytes",
-                self.max_len
-            ))
-            .into());
+            let reason = self.too_large(what, &len.to_string());
+            return Err(self.desync_error(reason));
         }
         Ok(())
     }
 
     /// Read one JSON-RPC message. Returns
-    /// `Err(TransportError::ConnectionClosed)` on clean EOF.
+    /// `Err(TransportError::ConnectionClosed)` on clean EOF, and
+    /// `Err(TransportError::InvalidMessage)` for every framing violation -
+    /// including every later read once one has happened.
     pub async fn read_message(&mut self) -> Result<String> {
+        if let Some(reason) = &self.desync {
+            return Err(TransportError::InvalidMessage(format!(
+                "transport desynchronised by an earlier framing violation ({reason}) \
+                 and cannot be resynchronised"
+            ))
+            .into());
+        }
         match self.framing {
             Framing::Auto => self.read_auto().await,
             Framing::Newline => self.read_newline().await,
@@ -160,7 +236,7 @@ where
             if trimmed.trim().is_empty() {
                 continue;
             }
-            if parse_content_length_header(trimmed).is_some() {
+            if content_length_value(trimmed).is_some() {
                 self.framing = Framing::ContentLength;
                 return self.read_content_length(trimmed).await;
             }
@@ -169,23 +245,77 @@ where
         }
     }
 
-    async fn read_content_length(&mut self, first: &str) -> Result<String> {
-        let content_length = parse_content_length_header(first).ok_or_else(|| {
-            TransportError::InvalidMessage(format!("expected Content-Length header, got: {first}"))
-        })?;
-        // Cap before allocating the body buffer.
-        self.check_len(content_length, "Content-Length")?;
+    /// Turn a declared `Content-Length` value into a length we are willing to
+    /// read, or the reason we are not. Rejects anything that is not a plain
+    /// in-range byte count, so no arithmetic downstream can be surprised.
+    fn declared_length(&self, value: &str) -> std::result::Result<usize, String> {
+        if value.is_empty() {
+            return Err("Content-Length header has an empty value".to_string());
+        }
+        if !value.bytes().all(|b| b.is_ascii_digit()) {
+            // Catches signs, whitespace, units, and anything else non-numeric;
+            // a negative value is refused here rather than wrapping.
+            return Err(format!(
+                "Content-Length value {} is not a byte count",
+                for_error(value)
+            ));
+        }
+        match value.parse::<usize>() {
+            Ok(len) if len > self.max_len => Err(self.too_large("Content-Length", value)),
+            Ok(len) => Ok(len),
+            // Digits alone, yet unparseable: larger than `usize` can hold, so
+            // past any cap by definition.
+            Err(_) => Err(self.too_large("Content-Length", value)),
+        }
+    }
 
-        // Consume any remaining headers up to the blank line.
+    async fn read_content_length(&mut self, first: &str) -> Result<String> {
+        // Parsed in its own statement so the immutable borrow of `self` ends
+        // before the arms need it mutably to record a desync.
+        let parsed = content_length_value(first).map(|value| self.declared_length(value));
+        let declared = match parsed {
+            Some(Ok(len)) => len,
+            Some(Err(reason)) => return Err(self.desync_error(reason)),
+            None => {
+                let reason = format!(
+                    "expected a Content-Length header, got: {}",
+                    for_error(first)
+                );
+                return Err(self.desync_error(reason));
+            }
+        };
+
+        // Consume any remaining headers up to the blank line, bounded so one
+        // frame cannot keep us reading headers indefinitely.
+        let mut lines = 1;
         loop {
             let line = self.read_line().await?;
             if trim_crlf(&line).is_empty() {
                 break;
             }
+            lines += 1;
+            if lines > MAX_HEADER_LINES {
+                let reason = format!("frame declares more than {MAX_HEADER_LINES} header lines");
+                return Err(self.desync_error(reason));
+            }
         }
 
-        let mut buf = vec![0u8; content_length];
-        self.reader.read_exact(&mut buf).await?;
+        // `declared` is within the cap, but it is still only a claim: read at
+        // most that many bytes into a buffer that grows with what actually
+        // arrives, so a peer that declares the cap and sends five bytes costs
+        // five bytes.
+        let mut buf = Vec::new();
+        (&mut self.reader)
+            .take(declared as u64)
+            .read_to_end(&mut buf)
+            .await?;
+        if buf.len() != declared {
+            let reason = format!(
+                "frame body ended after {} of {declared} declared bytes",
+                buf.len()
+            );
+            return Err(self.desync_error(reason));
+        }
         String::from_utf8(buf)
             .map_err(|e| TransportError::InvalidMessage(format!("invalid UTF-8: {e}")).into())
     }
@@ -198,15 +328,16 @@ mod tests {
 
     use super::*;
 
+    /// Header *recognition* is by name only, case-insensitively — whether the
+    /// value is usable is a separate question, answered by `declared_length`.
     #[test]
-    fn parses_content_length() {
-        assert_eq!(
-            parse_content_length_header("Content-Length: 10\r\n"),
-            Some(10)
-        );
-        assert_eq!(parse_content_length_header("content-length:  0"), Some(0));
-        assert_eq!(parse_content_length_header("Content-Type: x"), None);
-        assert_eq!(parse_content_length_header("garbage"), None);
+    fn recognises_content_length_header_by_name() {
+        assert_eq!(content_length_value("Content-Length: 10\r\n"), Some("10"));
+        assert_eq!(content_length_value("content-length:  0"), Some("0"));
+        assert_eq!(content_length_value("Content-Length:"), Some(""));
+        assert_eq!(content_length_value("Content-Length: nope"), Some("nope"));
+        assert_eq!(content_length_value("Content-Type: x"), None);
+        assert_eq!(content_length_value("garbage"), None);
     }
 
     #[test]
@@ -561,6 +692,28 @@ mod tests {
         assert!(
             largest < ALLOC_TRIPWIRE,
             "the body buffer must follow delivered bytes; largest allocation was {largest} bytes"
+        );
+    }
+
+    /// Acceptance: the refusal quotes at most a snippet of the declared value.
+    /// A declared length is peer text and can be padded with leading zeros to
+    /// any length the cap allows, and the refusal travels into logs and back to
+    /// the peer — it must not carry kilobytes of someone else's bytes with it.
+    #[tokio::test]
+    async fn oversize_content_length_error_truncates_the_declared_value() {
+        const MAX: usize = 8192;
+        let padded = format!("{}{}", "0".repeat(4096), MAX + 1);
+        let input = format!("Content-Length: {padded}\r\n\r\n").into_bytes();
+        let mut t = FramedTransport::new(BufReader::new(&input[..]), Vec::new(), MAX);
+        let err = read_bounded(&mut t)
+            .await
+            .expect_err("a padded oversize length must still be refused");
+        let msg = framing_error(&err);
+        assert!(msg.contains("exceeds maximum"), "{msg}");
+        assert!(
+            msg.len() < 256,
+            "refusal must not echo the padding ({} bytes): {msg}",
+            msg.len()
         );
     }
 

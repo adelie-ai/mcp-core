@@ -75,7 +75,23 @@ where
             // MC-4: a genuine read error (malformed framing, an oversize frame)
             // must propagate so the caller can exit non-zero — not be swallowed
             // as a clean shutdown, which would make the server silently go dark.
-            Err(e) => return Err(e),
+            Err(e) => {
+                // A framing violation ends the connection: the transport can no
+                // longer say where the next frame starts. Say so in the protocol
+                // first, best effort, so the peer gets a reason instead of a
+                // stream that just stops.
+                if let Error::Transport(TransportError::InvalidMessage(reason)) = &e {
+                    let resp = error_response(
+                        None,
+                        code::PARSE_ERROR,
+                        &format!("framing error: {reason}"),
+                    );
+                    if let Ok(text) = serde_json::to_string(&resp) {
+                        let _ = transport.write_message(&text).await;
+                    }
+                }
+                return Err(e);
+            }
         };
         if raw.trim().is_empty() {
             continue;
