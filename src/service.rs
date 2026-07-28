@@ -15,22 +15,30 @@ pub trait McpService: Send + Sync + 'static {
 
     /// Execute a tool call.
     ///
-    /// Return [`ToolReply`] on success. For a *tool* failure (bad input the
-    /// model should see and react to, unknown tool, upstream error) return
-    /// [`CallError::Tool`] — the core surfaces it as `isError: true` content
-    /// per the MCP spec, not as a JSON-RPC protocol error. Reserve
-    /// [`CallError::InvalidParams`]/[`CallError::Internal`] for genuine
-    /// protocol-level faults.
+    /// Return [`ToolReply`] on success. Every failure the model could plausibly
+    /// correct — bad arguments, unknown tool, upstream error — becomes
+    /// `isError: true` content rather than a JSON-RPC protocol error, because
+    /// the model never sees a protocol error: it surfaces as a failed call and
+    /// takes the turn with it. Reserve [`CallError::Internal`] for faults the
+    /// model cannot act on.
     ///
     /// Mapping guide:
-    /// - missing/unparseable argument → [`CallError::InvalidParams`] (`-32602`)
+    /// - missing/unparseable argument → [`CallError::InvalidParams`]
     /// - valid input but no result (e.g. "not found", upstream `429`/`5xx`) →
-    ///   [`CallError::Tool`] (`isError` content the model can react to)
+    ///   [`CallError::Tool`]
     /// - unknown tool name → [`CallError::Tool`]
-    /// - bug / serialize failure → [`CallError::Internal`] (`-32603`)
+    /// - bug / reply-serialize failure → [`CallError::Internal`] (`-32603`)
+    ///
+    /// The first three all reach the client as `isError` content; the variant
+    /// records *why* at the call site. Make the message name the offending
+    /// field and what was expected — it is the only thing the model has to
+    /// correct against.
     ///
     /// `serde_json::Error` converts into [`CallError::Internal`], so
-    /// `ToolReply::json(&value)?` can be used directly in this method.
+    /// `ToolReply::json(&value)?` can be used directly in this method. If you
+    /// deserialize *arguments* with `?`, that lands in `Internal` too — which
+    /// is wrong for model-supplied input; map it to
+    /// [`CallError::invalid_params`] explicitly.
     async fn call_tool(&self, name: &str, arguments: &Value) -> Result<ToolReply, CallError>;
 
     /// Optional shutdown hook.
@@ -196,15 +204,27 @@ impl ToolReply {
 }
 
 /// Why a tool call failed.
+///
+/// The split that matters is *can the model do anything about it*. `Tool` and
+/// `InvalidParams` both reach the client as `isError: true` content the model
+/// can read and retry against; only `Internal` is a JSON-RPC protocol error.
 #[derive(Debug)]
 pub enum CallError {
-    /// A tool-execution failure — surfaced to the client as `isError: true`
-    /// content (a successful JSON-RPC response), per the MCP spec. This is the
-    /// right variant for almost all failures, including "unknown tool".
+    /// A tool-execution failure — surfaced as `isError: true` content (a
+    /// successful JSON-RPC response). The right variant for almost all
+    /// failures, including "unknown tool".
     Tool(String),
-    /// The parameters were structurally invalid — JSON-RPC `-32602`.
+    /// The model supplied arguments the tool could not use.
+    ///
+    /// Also `isError` content, and on the wire indistinguishable from
+    /// [`CallError::Tool`] — per SEP-1303, argument validation is a
+    /// tool-execution error so the model can self-correct. The variant is kept
+    /// because it records the cause at the call site, and because the wire
+    /// treatment is a property of the negotiated protocol dialect rather than
+    /// of the error itself.
     InvalidParams(String),
-    /// An internal server fault — JSON-RPC `-32603`.
+    /// An internal server fault — JSON-RPC `-32603`. Not something the model
+    /// supplied or can fix, so it stays a protocol error.
     Internal(String),
 }
 
@@ -213,7 +233,8 @@ impl CallError {
     pub fn tool(message: impl Into<String>) -> Self {
         CallError::Tool(message.into())
     }
-    /// Invalid params (becomes JSON-RPC `-32602`).
+    /// Bad model-supplied arguments (becomes `isError` content). Name the field
+    /// and what was expected.
     pub fn invalid_params(message: impl Into<String>) -> Self {
         CallError::InvalidParams(message.into())
     }

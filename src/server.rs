@@ -190,8 +190,16 @@ impl Session {
                 Outcome::Result(reply.to_result_json())
             }
             // Tool failures are a successful response with isError content.
-            Err(CallError::Tool(msg)) => Outcome::Result(tool_error_result(&msg)),
-            Err(CallError::InvalidParams(msg)) => Outcome::Error(code::INVALID_PARAMS, msg),
+            //
+            // Why InvalidParams lands here too (SEP-1303): bad arguments are
+            // something the model supplied and can correct, so it has to see
+            // them. A JSON-RPC error is invisible to the model and takes the
+            // turn with it. Only faults the model cannot act on stay protocol
+            // errors — a malformed request (no tool name, above) and an
+            // internal server fault (below).
+            Err(CallError::Tool(msg) | CallError::InvalidParams(msg)) => {
+                Outcome::Result(tool_error_result(&msg))
+            }
             Err(CallError::Internal(msg)) => Outcome::Error(code::INTERNAL_ERROR, msg),
         }
     }
@@ -376,8 +384,7 @@ mod tests {
             .await;
         let resp = d.response.expect("tools/call must produce a response");
         assert_eq!(
-            resp["result"]["content"][0]["text"],
-            "argument `path` must be a string, got number",
+            resp["result"]["content"][0]["text"], "argument `path` must be a string, got number",
             "the model needs the validation detail to correct against"
         );
     }
@@ -454,8 +461,7 @@ mod tests {
             bad_arguments["content"][0]["type"]
         );
         assert_ne!(
-            tool_failure["content"][0]["text"],
-            bad_arguments["content"][0]["text"],
+            tool_failure["content"][0]["text"], bad_arguments["content"][0]["text"],
             "same shape, different message"
         );
     }
