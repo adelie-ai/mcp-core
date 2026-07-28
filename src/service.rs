@@ -58,7 +58,12 @@ pub struct ToolDef {
     pub name: String,
     /// Human/model-facing description.
     pub description: String,
-    /// JSON Schema for the tool's `arguments` object.
+    /// JSON Schema for the tool's `arguments` object, emitted verbatim.
+    ///
+    /// Expected to be **JSON Schema 2020-12**, declared by omitting `$schema`
+    /// (the MCP default). See the crate docs for the keyword rules; the ones
+    /// that bite are array-form `items`, boolean `exclusiveMinimum`,
+    /// `definitions`, and a top-level combinator.
     pub input_schema: Value,
     /// Optional MCP tool annotations (`readOnlyHint`, `title`, …).
     pub annotations: Option<Value>,
@@ -260,5 +265,111 @@ impl From<serde_json::Error> for CallError {
     /// A (de)serialization failure is an internal fault.
     fn from(e: serde_json::Error) -> Self {
         CallError::Internal(e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plain_tool() -> ToolDef {
+        ToolDef::new(
+            "echo",
+            "echo the input",
+            json!({
+                "type": "object",
+                "properties": { "text": { "type": "string" } },
+                "required": ["text"],
+            }),
+        )
+    }
+
+    /// SEP-1613: 2020-12 is the default dialect, declared by *absence* of
+    /// `$schema`. Emitting it would be an opt-out, so mcp-core must not add one.
+    #[test]
+    fn tool_input_schemas_declare_expected_dialect() {
+        let wire = plain_tool().to_json();
+        assert!(
+            wire["inputSchema"].get("$schema").is_none(),
+            "2020-12 is the MCP default; a `$schema` key opts *out* of it"
+        );
+    }
+
+    /// The escape hatch has to keep working: a server that genuinely needs an
+    /// older draft says so with `$schema`, and mcp-core must not strip it.
+    #[test]
+    fn explicit_schema_dialect_is_passed_through() {
+        let draft07 = "http://json-schema.org/draft-07/schema#";
+        let tool = ToolDef::new(
+            "legacy",
+            "declares an older draft",
+            json!({ "$schema": draft07, "type": "object" }),
+        );
+        assert_eq!(tool.to_json()["inputSchema"]["$schema"], draft07);
+    }
+
+    /// mcp-core is dialect-neutral: the schema reaches the wire byte-identical.
+    /// This is what lets the fleet absorb a dialect change without touching 13
+    /// servers, per ADR 0001.
+    #[test]
+    fn tool_input_schema_reaches_the_wire_verbatim() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "tags": { "type": "array", "items": { "type": "string" } },
+                "mode": { "enum": ["fast", "slow"] },
+            },
+            "additionalProperties": false,
+        });
+        let tool = ToolDef::new("t", "d", schema.clone());
+        assert_eq!(tool.to_json()["inputSchema"], schema);
+    }
+
+    /// Guards the *core*, not the fleet: `ToolDef` takes an opaque `Value`, so
+    /// this proves only that mcp-core introduces none of the keywords whose
+    /// meaning differs between draft-07 and 2020-12. The fleet-wide audit lives
+    /// in the PR for this change.
+    #[test]
+    fn tool_input_schemas_avoid_ambiguous_draft_keywords() {
+        const AMBIGUOUS: &[&str] = &["definitions", "prefixItems", "$defs", "$ref"];
+        let wire = plain_tool().to_json().to_string();
+        for keyword in AMBIGUOUS {
+            assert!(
+                !wire.contains(keyword),
+                "mcp-core must not introduce `{keyword}` into a tool definition"
+            );
+        }
+
+        // `exclusiveMinimum` flipped from boolean (draft-04) to number (draft-06
+        // onward). A server passing the boolean form is passed through
+        // unchanged rather than silently "fixed" — quietly rewriting a server's
+        // schema would be worse than emitting what it asked for.
+        let legacy = json!({
+            "type": "object",
+            "properties": { "n": { "type": "number", "minimum": 0, "exclusiveMinimum": true } },
+        });
+        let tool = ToolDef::new("t", "d", legacy.clone());
+        assert_eq!(tool.to_json()["inputSchema"], legacy);
+    }
+
+    /// The spec's recommended shape for a tool that takes no arguments.
+    #[test]
+    fn no_argument_tool_schema_round_trips() {
+        let tool = ToolDef::new(
+            "now",
+            "current time",
+            json!({ "type": "object", "additionalProperties": false }),
+        );
+        let wire = tool.to_json();
+        assert_eq!(wire["inputSchema"]["type"], "object");
+        assert_eq!(wire["inputSchema"]["additionalProperties"], false);
+    }
+
+    #[test]
+    fn annotations_are_omitted_when_unset() {
+        assert!(
+            plain_tool().to_json().get("annotations").is_none(),
+            "an unset optional key must be absent, not null"
+        );
     }
 }

@@ -61,6 +61,35 @@
 //! Stdio and unix transports work with the default features; enable websocket
 //! with `features = ["websocket"]`. A server with no extra flags can use
 //! [`run_simple`] (no turbofish, no empty args struct) instead of [`run`].
+//!
+//! ## Tool schema dialect
+//!
+//! Tool schemas are **JSON Schema 2020-12**, and say so by *omitting* `$schema`
+//! — per SEP-1613 the MCP spec defines 2020-12 as the default dialect and reads
+//! a `$schema` key as an opt-*out*. Do not add one to declare 2020-12; add one
+//! only if a tool genuinely needs an older draft.
+//!
+//! mcp-core passes `input_schema` to the wire verbatim: it never injects,
+//! strips, or rewrites a key. The dialect is therefore a contract between the
+//! server author and the client, and this list is the whole of it:
+//!
+//! - Write plain `type` / `properties` / `required` objects. They mean the same
+//!   thing in every draft, which is why the fleet has never hit this.
+//! - `items` takes a **single schema**. The draft-07 array form (tuple
+//!   validation) became `prefixItems` in 2020-12 and an array `items` is
+//!   misread by a 2020-12 validator.
+//! - `exclusiveMinimum` / `exclusiveMaximum` take a **number**, not the
+//!   draft-04 boolean.
+//! - Use `$defs`, not `definitions`, for local subschemas.
+//! - Prefer `{"type": "object", "additionalProperties": false}` for a tool that
+//!   takes no arguments.
+//! - Avoid a top-level combinator (`oneOf` / `anyOf` / `allOf`). It is legal
+//!   JSON Schema, but some model providers reject a tool whose root is not a
+//!   plain object — which has already cost us one production outage.
+//!
+//! Generating schemas with `schemars` 1.x is 2020-12-native; strip the
+//! `$schema` and `title` keys it emits so the result follows the convention
+//! above. `schemars` 0.8 emits draft-07 and is not suitable for tool schemas.
 
 pub mod args;
 #[cfg(feature = "auth")]
