@@ -155,12 +155,30 @@ impl Session {
         // sending the notification.
         self.initialized = true;
 
+        let mut server_info = json!({
+            "name": self.core.config.name,
+            "version": self.core.config.version,
+        });
+
+        // SEP-973 added title/description/websiteUrl to `Implementation` in
+        // 2025-11-25, so an older session must see the shape it expects. The
+        // gate is cheap here because `negotiated` is already in hand; revision
+        // strings are `YYYY-MM-DD`, so string order is chronological order.
+        if negotiated.as_str() >= "2025-11-25" {
+            for (key, value) in [
+                ("title", &self.core.config.title),
+                ("description", &self.core.config.description),
+                ("websiteUrl", &self.core.config.website_url),
+            ] {
+                if let Some(value) = value {
+                    server_info[key] = json!(value);
+                }
+            }
+        }
+
         let mut result = json!({
             "protocolVersion": negotiated,
-            "serverInfo": {
-                "name": self.core.config.name,
-                "version": self.core.config.version,
-            },
+            "serverInfo": server_info,
             "capabilities": {
                 "tools": { "listChanged": self.core.config.tools_list_changed },
             },
@@ -351,6 +369,91 @@ mod tests {
         assert_eq!(result["protocolVersion"], "2025-11-25");
         assert_eq!(result["serverInfo"]["name"], "demo");
         assert!(s.initialized);
+    }
+
+    /// Drive `initialize` against `config` and return the `serverInfo` object.
+    async fn server_info(config: ServerConfig, requested: &str) -> Value {
+        let core = ServerCore::new(config, Arc::new(Demo));
+        let mut s = Session::new(core);
+        let d = s
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                "params": { "protocolVersion": requested }
+            }))
+            .await;
+        d.response.expect("initialize must produce a response")["result"]["serverInfo"].clone()
+    }
+
+    /// A config declaring all three optional SEP-973 fields.
+    fn described() -> ServerConfig {
+        ServerConfig::new("demo", "0.0.0")
+            .title("Demo Server")
+            .description("Echoes text back for testing")
+            .website_url("https://example.com/demo")
+    }
+
+    #[tokio::test]
+    async fn server_info_omits_optional_metadata_when_unset() {
+        let info = server_info(ServerConfig::new("demo", "0.0.0"), "2025-11-25").await;
+        let keys: Vec<&String> = info
+            .as_object()
+            .expect("serverInfo must be an object")
+            .keys()
+            .collect();
+        assert_eq!(
+            keys.len(),
+            2,
+            "an unset optional key must be absent, not null: {info}"
+        );
+        for absent in ["title", "description", "websiteUrl"] {
+            assert!(info.get(absent).is_none(), "{absent} must not be emitted");
+        }
+    }
+
+    #[tokio::test]
+    async fn server_info_includes_metadata_when_set() {
+        let info = server_info(described(), "2025-11-25").await;
+        assert_eq!(info["title"], "Demo Server");
+        assert_eq!(info["description"], "Echoes text back for testing");
+        assert_eq!(
+            info["websiteUrl"], "https://example.com/demo",
+            "the spec spells this camelCase"
+        );
+    }
+
+    /// The version gate: these fields arrived in 2025-11-25, so an older session
+    /// must see the pre-2025-11-25 `Implementation` shape.
+    #[tokio::test]
+    async fn server_info_metadata_withheld_on_pre_2025_11_25_sessions() {
+        let info = server_info(described(), "2025-06-18").await;
+        for absent in ["title", "description", "websiteUrl"] {
+            assert!(
+                info.get(absent).is_none(),
+                "{absent} must be withheld from a 2025-06-18 session: {info}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn server_info_metadata_partially_set_omits_only_the_unset_keys() {
+        let config = ServerConfig::new("demo", "0.0.0").description("Just a description");
+        let info = server_info(config, "2025-11-25").await;
+        assert_eq!(info["description"], "Just a description");
+        assert!(info.get("title").is_none());
+        assert!(info.get("websiteUrl").is_none());
+    }
+
+    #[tokio::test]
+    async fn server_info_always_carries_name_and_version() {
+        for (config, requested) in [
+            (ServerConfig::new("demo", "0.0.0"), "2025-11-25"),
+            (described(), "2025-11-25"),
+            (described(), "2025-06-18"),
+        ] {
+            let info = server_info(config, requested).await;
+            assert_eq!(info["name"], "demo");
+            assert_eq!(info["version"], "0.0.0");
+        }
     }
 
     #[tokio::test]

@@ -122,7 +122,22 @@ pub struct ServerConfig {
     /// `serverInfo.version` reported in the initialize response.
     pub version: String,
     /// Optional `instructions` string returned from initialize.
+    ///
+    /// Per the spec this is usage guidance aimed at the *model* — how to drive
+    /// this server. For a statement of what the server *is*, set
+    /// [`Self::description`] instead.
     pub instructions: Option<String>,
+    /// Optional `serverInfo.title` — a human-facing display name, where
+    /// [`Self::name`] is the programmatic identity (SEP-973).
+    pub title: Option<String>,
+    /// Optional `serverInfo.description` — what this server offers.
+    ///
+    /// Distinct from [`Self::instructions`]: this answers "what is this
+    /// server", which is what a client's tool-search matches against, while
+    /// `instructions` answers "how do I drive it".
+    pub description: Option<String>,
+    /// Optional `serverInfo.websiteUrl` — the server's home page (SEP-973).
+    pub website_url: Option<String>,
     /// Transports this server is allowed to serve.
     pub transports: EnabledTransports,
     /// Transport used when the CLI doesn't specify one.
@@ -151,6 +166,9 @@ impl ServerConfig {
             name: name.into(),
             version: version.into(),
             instructions: None,
+            title: None,
+            description: None,
+            website_url: None,
             transports: EnabledTransports::default(),
             default_transport: TransportKind::Stdio,
             protocol_versions: DEFAULT_PROTOCOL_VERSIONS
@@ -167,6 +185,34 @@ impl ServerConfig {
     /// Set the `instructions` string returned from initialize.
     pub fn instructions(mut self, instructions: impl Into<String>) -> Self {
         self.instructions = Some(instructions.into());
+        self
+    }
+
+    /// Set `serverInfo.title`, a human-facing display name (SEP-973).
+    ///
+    /// Only reaches the wire on a session that negotiated `2025-11-25` or
+    /// later; older clients see `name` / `version` alone.
+    pub fn title(mut self, title: impl Into<String>) -> Self {
+        self.title = Some(title.into());
+        self
+    }
+
+    /// Set `serverInfo.description`, a statement of what this server offers
+    /// (SEP-973).
+    ///
+    /// Why prefer this over [`Self::instructions`]: clients seed a server's
+    /// searchable description from it, and `instructions` is usage guidance for
+    /// the model rather than a description of the server. Same version gate as
+    /// [`Self::title`].
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    /// Set `serverInfo.websiteUrl`, the server's home page (SEP-973). Same
+    /// version gate as [`Self::title`].
+    pub fn website_url(mut self, website_url: impl Into<String>) -> Self {
+        self.website_url = Some(website_url.into());
         self
     }
 
