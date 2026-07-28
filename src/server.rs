@@ -67,11 +67,12 @@ impl Session {
     /// any notifications to flush.
     pub async fn handle_message(&mut self, message: Value) -> Dispatch {
         // MC-5: a JSON-RPC payload must be a single Request/Notification object.
-        // An array (batch) or any non-object scalar is not a valid Request — and
-        // we don't support batching despite advertising protocol versions that
-        // define it — so answer INVALID_REQUEST with a null id rather than
-        // silently dropping it (an array has no `id`, so the old code treated it
-        // as a notification and never replied, hanging the client).
+        // An array (batch) or any non-object scalar is not a valid Request —
+        // batching was removed from the spec in 2025-06-18 and every version we
+        // negotiate is at or above that — so answer INVALID_REQUEST with a null
+        // id rather than silently dropping it (an array has no `id`, so the old
+        // code treated it as a notification and never replied, hanging the
+        // client).
         if !message.is_object() {
             let msg = if message.is_array() {
                 "batch requests (JSON arrays) are not supported"
@@ -215,6 +216,18 @@ impl Session {
         )
     }
 
+    /// Resolve the version for this session: echo the request when we support
+    /// it, otherwise answer with the newest we do. Answering with a supported
+    /// version rather than echoing an unsupported one is the spec's required
+    /// behaviour, so retiring a revision degrades a client rather than breaking
+    /// it.
+    ///
+    /// Trap for whoever adds `MCP-Protocol-Version` header handling: the
+    /// Streamable HTTP rules say a server seeing no header SHOULD assume
+    /// `2025-03-26` and MUST answer `400` for a version it does not support.
+    /// Composed literally, and now that `2025-03-26` is retired, that 400s every
+    /// header-less client. Treat an absent header as "unknown — use the version
+    /// negotiated for this session", never as a literal `2025-03-26`.
     fn negotiate_version(&self, requested: &str) -> String {
         if self
             .core
@@ -302,13 +315,32 @@ mod tests {
         Session::new(core)
     }
 
+    /// Drive `initialize` and return the negotiated version. `requested` of
+    /// `None` omits the `protocolVersion` param entirely.
+    async fn negotiated(requested: Option<&str>) -> String {
+        let mut s = session();
+        let params = match requested {
+            Some(v) => json!({ "protocolVersion": v }),
+            None => json!({}),
+        };
+        let d = s
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params
+            }))
+            .await;
+        d.response.expect("initialize must produce a response")["result"]["protocolVersion"]
+            .as_str()
+            .expect("initialize must report a protocolVersion")
+            .to_string()
+    }
+
     #[tokio::test]
     async fn initialize_has_no_top_level_tools_key_and_negotiates() {
         let mut s = session();
         let d = s
             .handle_message(json!({
                 "jsonrpc": "2.0", "id": 1, "method": "initialize",
-                "params": { "protocolVersion": "2025-03-26" }
+                "params": { "protocolVersion": "2025-11-25" }
             }))
             .await;
         let result = &d.response.unwrap()["result"];
@@ -316,24 +348,44 @@ mod tests {
             result.get("tools").is_none(),
             "must not embed tools in initialize"
         );
-        assert_eq!(result["protocolVersion"], "2025-03-26");
+        assert_eq!(result["protocolVersion"], "2025-11-25");
         assert_eq!(result["serverInfo"]["name"], "demo");
         assert!(s.initialized);
     }
 
     #[tokio::test]
-    async fn unknown_protocol_version_falls_back_to_latest() {
-        let mut s = session();
-        let d = s
-            .handle_message(json!({
-                "jsonrpc": "2.0", "id": 1, "method": "initialize",
-                "params": { "protocolVersion": "1999-01-01" }
-            }))
-            .await;
-        assert_eq!(
-            d.response.unwrap()["result"]["protocolVersion"],
-            "2025-06-18"
-        );
+    async fn negotiates_current_revision_when_requested() {
+        assert_eq!(negotiated(Some("2025-11-25")).await, "2025-11-25");
+    }
+
+    /// A client on the previous revision is not forced up.
+    #[tokio::test]
+    async fn negotiates_previous_revision_when_requested() {
+        assert_eq!(negotiated(Some("2025-06-18")).await, "2025-06-18");
+    }
+
+    #[tokio::test]
+    async fn unknown_version_falls_back_to_current_revision() {
+        assert_eq!(negotiated(Some("1999-01-01")).await, "2025-11-25");
+    }
+
+    /// Retiring a version is a correct negotiation outcome, not a hard break:
+    /// the client gets a supported version back rather than an error or an echo
+    /// of something we no longer speak.
+    #[tokio::test]
+    async fn retired_versions_are_not_echoed_back() {
+        for retired in ["2024-11-05", "2025-03-26"] {
+            assert_eq!(
+                negotiated(Some(retired)).await,
+                "2025-11-25",
+                "{retired} is retired and must not be echoed back"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_protocol_version_defaults_to_current_revision() {
+        assert_eq!(negotiated(None).await, "2025-11-25");
     }
 
     #[tokio::test]
@@ -494,8 +546,9 @@ mod tests {
     #[tokio::test]
     async fn batch_array_is_invalid_request_not_silently_dropped() {
         // MC-5: a JSON-RPC batch (array) payload must get an INVALID_REQUEST
-        // response (null id), not be silently treated as a notification — we
-        // advertise protocol versions that define batching but don't support it.
+        // response (null id), not be silently treated as a notification. Since
+        // 2024-11-05 and 2025-03-26 were retired this is unconditionally
+        // correct — no version we negotiate defines batching.
         let mut s = session();
         let d = s
             .handle_message(json!([

@@ -101,7 +101,13 @@ pub struct WsClaimBindings {
 }
 
 /// MCP protocol versions this core knows how to negotiate, newest last.
-pub const DEFAULT_PROTOCOL_VERSIONS: &[&str] = &["2024-11-05", "2025-03-26", "2025-06-18"];
+///
+/// `2024-11-05` and `2025-03-26` are retired. Both defined JSON-RPC batching,
+/// which this core has never supported and which the spec removed in
+/// `2025-06-18`; advertising them claimed a capability we do not have. A client
+/// requesting a retired version is answered with a supported one rather than an
+/// error, which is the negotiation behaviour the spec requires.
+pub const DEFAULT_PROTOCOL_VERSIONS: &[&str] = &["2025-06-18", "2025-11-25"];
 
 /// Default upper bound on a single framed message (64 MiB).
 pub const DEFAULT_MAX_CONTENT_LENGTH: usize = 64 * 1024 * 1024;
@@ -121,7 +127,9 @@ pub struct ServerConfig {
     pub transports: EnabledTransports,
     /// Transport used when the CLI doesn't specify one.
     pub default_transport: TransportKind,
-    /// Protocol versions to negotiate against (newest last).
+    /// Protocol versions to negotiate against, **newest last** — the order is
+    /// load-bearing, since the last entry is what an unrecognised request is
+    /// answered with. Defaults to [`DEFAULT_PROTOCOL_VERSIONS`].
     pub protocol_versions: Vec<String>,
     /// Whether `tools/list` can change at runtime (advertised as
     /// `capabilities.tools.listChanged`).
@@ -233,17 +241,41 @@ impl ServerConfig {
 
     /// The newest supported protocol version (returned when a client requests
     /// one we don't recognise).
+    ///
+    /// Why the literal fallback: `protocol_versions` is a public field, so a
+    /// server can empty it. Reporting the current revision is the least
+    /// surprising answer; keep it in step with the last entry of
+    /// [`DEFAULT_PROTOCOL_VERSIONS`].
     pub(crate) fn latest_protocol_version(&self) -> &str {
         self.protocol_versions
             .last()
             .map(|s| s.as_str())
-            .unwrap_or("2025-06-18")
+            .unwrap_or("2025-11-25")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An empty configured list must still report something current, not a
+    /// revision we have retired.
+    #[test]
+    fn latest_protocol_version_fallback_is_current() {
+        let mut cfg = ServerConfig::new("x", "1.0");
+        cfg.protocol_versions.clear();
+        assert_eq!(cfg.latest_protocol_version(), "2025-11-25");
+    }
+
+    #[test]
+    fn default_protocol_versions_are_the_supported_set() {
+        assert_eq!(DEFAULT_PROTOCOL_VERSIONS, &["2025-06-18", "2025-11-25"]);
+        assert_eq!(
+            ServerConfig::new("x", "1.0").latest_protocol_version(),
+            "2025-11-25",
+            "newest last: the default config negotiates the current revision"
+        );
+    }
 
     #[test]
     fn websocket_off_by_default() {
