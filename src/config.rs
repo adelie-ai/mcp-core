@@ -245,6 +245,25 @@ impl ServerConfig {
 mod tests {
     use super::*;
 
+    /// An empty configured list must still report something current, not a
+    /// revision we have retired.
+    #[test]
+    fn latest_protocol_version_fallback_is_current() {
+        let mut cfg = ServerConfig::new("x", "1.0");
+        cfg.protocol_versions.clear();
+        assert_eq!(cfg.latest_protocol_version(), "2025-11-25");
+    }
+
+    #[test]
+    fn default_protocol_versions_are_the_supported_set() {
+        assert_eq!(DEFAULT_PROTOCOL_VERSIONS, &["2025-06-18", "2025-11-25"]);
+        assert_eq!(
+            ServerConfig::new("x", "1.0").latest_protocol_version(),
+            "2025-11-25",
+            "newest last: the default config negotiates the current revision"
+        );
+    }
+
     #[test]
     fn websocket_off_by_default() {
         // MC-7: a fresh config exposes stdio only; the network transport is
