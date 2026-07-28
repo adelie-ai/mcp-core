@@ -11,6 +11,17 @@ A new optional dependency stays behind its feature so a stdio-only server never 
 Warnings are denied mechanically - `[lints] rust.warnings = "deny"` and `clippy.all = "deny"`
 in `Cargo.toml` - so `cargo build` / `test` / `clippy` hard-fail on any warning.
 
+## Architecture decisions
+
+`docs/adr/` records the constraints this crate is held to. Read them before changing the
+dispatcher or the public `McpService` surface; they exist because the decisions are easy
+to violate by accident and expensive to walk back. A change that contradicts an Accepted
+ADR needs a new ADR, not a quiet edit.
+
+Currently binding: [ADR 0001 - The MCP protocol dialect seam](docs/adr/0001-mcp-protocol-dialect-seam.md),
+which keeps protocol-version handling out of `McpService` so the fleet absorbs a spec
+revision as a pin bump rather than 13 server rewrites.
+
 ## Rust Conventions
 
 Apply these consistently. The pre-commit checklist at the bottom is the floor.
