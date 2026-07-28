@@ -280,6 +280,10 @@ mod tests {
             match name {
                 "echo" => Ok(ToolReply::text(args.to_string())),
                 "boom" => Err(CallError::tool("kaboom")),
+                "badargs" => Err(CallError::invalid_params(
+                    "argument `path` must be a string, got number",
+                )),
+                "faulty" => Err(CallError::internal("connection pool exhausted")),
                 _ => Err(CallError::tool(format!("unknown tool: {name}"))),
             }
         }
@@ -340,8 +344,48 @@ mod tests {
         assert_eq!(resp["result"]["content"][0]["text"], "kaboom");
     }
 
+    /// SEP-1303: bad tool arguments are a *tool* failure the model can read and
+    /// correct, not a protocol error that kills the turn.
     #[tokio::test]
-    async fn missing_tool_name_is_invalid_params() {
+    async fn invalid_tool_arguments_return_tool_error_not_protocol_error() {
+        let mut s = session();
+        s.initialized = true;
+        let d = s
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+                "params": { "name": "badargs", "arguments": { "path": 7 } }
+            }))
+            .await;
+        let resp = d.response.expect("tools/call must produce a response");
+        assert!(
+            resp.get("error").is_none(),
+            "validation failure must not be a JSON-RPC error: {resp}"
+        );
+        assert_eq!(resp["result"]["isError"], true);
+    }
+
+    #[tokio::test]
+    async fn invalid_tool_arguments_message_reaches_the_model() {
+        let mut s = session();
+        s.initialized = true;
+        let d = s
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 11, "method": "tools/call",
+                "params": { "name": "badargs", "arguments": { "path": 7 } }
+            }))
+            .await;
+        let resp = d.response.expect("tools/call must produce a response");
+        assert_eq!(
+            resp["result"]["content"][0]["text"],
+            "argument `path` must be a string, got number",
+            "the model needs the validation detail to correct against"
+        );
+    }
+
+    /// The boundary that must not move: a `tools/call` with no `name` is a
+    /// malformed JSON-RPC request, not bad tool input.
+    #[tokio::test]
+    async fn missing_tool_name_is_still_a_protocol_error() {
         let mut s = session();
         s.initialized = true;
         let d = s
@@ -350,7 +394,70 @@ mod tests {
                 "params": {}
             }))
             .await;
-        assert_eq!(d.response.unwrap()["error"]["code"], code::INVALID_PARAMS);
+        let resp = d.response.expect("tools/call must produce a response");
+        assert_eq!(resp["error"]["code"], code::INVALID_PARAMS);
+        assert!(resp.get("result").is_none());
+    }
+
+    #[tokio::test]
+    async fn internal_tool_failure_is_still_a_protocol_error() {
+        let mut s = session();
+        s.initialized = true;
+        let d = s
+            .handle_message(json!({
+                "jsonrpc": "2.0", "id": 12, "method": "tools/call",
+                "params": { "name": "faulty", "arguments": {} }
+            }))
+            .await;
+        let resp = d.response.expect("tools/call must produce a response");
+        assert_eq!(
+            resp["error"]["code"],
+            code::INTERNAL_ERROR,
+            "a server fault is not something the model can correct"
+        );
+        assert!(resp.get("result").is_none());
+    }
+
+    /// The model must see one consistent failure mode, so a `Tool` failure and
+    /// an `InvalidParams` failure differ only in their message.
+    #[tokio::test]
+    async fn tool_error_and_invalid_params_are_indistinguishable_on_the_wire() {
+        async fn call(tool: &str) -> Value {
+            let mut s = session();
+            s.initialized = true;
+            let d = s
+                .handle_message(json!({
+                    "jsonrpc": "2.0", "id": 13, "method": "tools/call",
+                    "params": { "name": tool, "arguments": {} }
+                }))
+                .await;
+            d.response.expect("tools/call must produce a response")["result"].clone()
+        }
+
+        let tool_failure = call("boom").await;
+        let bad_arguments = call("badargs").await;
+
+        let shape = |v: &Value| {
+            let mut keys: Vec<String> = v
+                .as_object()
+                .expect("result must be an object")
+                .keys()
+                .cloned()
+                .collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(shape(&tool_failure), shape(&bad_arguments));
+        assert_eq!(tool_failure["isError"], bad_arguments["isError"]);
+        assert_eq!(
+            tool_failure["content"][0]["type"],
+            bad_arguments["content"][0]["type"]
+        );
+        assert_ne!(
+            tool_failure["content"][0]["text"],
+            bad_arguments["content"][0]["text"],
+            "same shape, different message"
+        );
     }
 
     #[tokio::test]
