@@ -155,12 +155,30 @@ impl Session {
         // sending the notification.
         self.initialized = true;
 
+        let mut server_info = json!({
+            "name": self.core.config.name,
+            "version": self.core.config.version,
+        });
+
+        // SEP-973 added title/description/websiteUrl to `Implementation` in
+        // 2025-11-25, so an older session must see the shape it expects. The
+        // gate is cheap here because `negotiated` is already in hand; revision
+        // strings are `YYYY-MM-DD`, so string order is chronological order.
+        if negotiated.as_str() >= "2025-11-25" {
+            for (key, value) in [
+                ("title", &self.core.config.title),
+                ("description", &self.core.config.description),
+                ("websiteUrl", &self.core.config.website_url),
+            ] {
+                if let Some(value) = value {
+                    server_info[key] = json!(value);
+                }
+            }
+        }
+
         let mut result = json!({
             "protocolVersion": negotiated,
-            "serverInfo": {
-                "name": self.core.config.name,
-                "version": self.core.config.version,
-            },
+            "serverInfo": server_info,
             "capabilities": {
                 "tools": { "listChanged": self.core.config.tools_list_changed },
             },
