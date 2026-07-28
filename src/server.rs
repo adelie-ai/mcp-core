@@ -67,11 +67,12 @@ impl Session {
     /// any notifications to flush.
     pub async fn handle_message(&mut self, message: Value) -> Dispatch {
         // MC-5: a JSON-RPC payload must be a single Request/Notification object.
-        // An array (batch) or any non-object scalar is not a valid Request — and
-        // we don't support batching despite advertising protocol versions that
-        // define it — so answer INVALID_REQUEST with a null id rather than
-        // silently dropping it (an array has no `id`, so the old code treated it
-        // as a notification and never replied, hanging the client).
+        // An array (batch) or any non-object scalar is not a valid Request —
+        // batching was removed from the spec in 2025-06-18 and every version we
+        // negotiate is at or above that — so answer INVALID_REQUEST with a null
+        // id rather than silently dropping it (an array has no `id`, so the old
+        // code treated it as a notification and never replied, hanging the
+        // client).
         if !message.is_object() {
             let msg = if message.is_array() {
                 "batch requests (JSON arrays) are not supported"
@@ -215,6 +216,18 @@ impl Session {
         )
     }
 
+    /// Resolve the version for this session: echo the request when we support
+    /// it, otherwise answer with the newest we do. Answering with a supported
+    /// version rather than echoing an unsupported one is the spec's required
+    /// behaviour, so retiring a revision degrades a client rather than breaking
+    /// it.
+    ///
+    /// Trap for whoever adds `MCP-Protocol-Version` header handling: the
+    /// Streamable HTTP rules say a server seeing no header SHOULD assume
+    /// `2025-03-26` and MUST answer `400` for a version it does not support.
+    /// Composed literally, and now that `2025-03-26` is retired, that 400s every
+    /// header-less client. Treat an absent header as "unknown — use the version
+    /// negotiated for this session", never as a literal `2025-03-26`.
     fn negotiate_version(&self, requested: &str) -> String {
         if self
             .core
@@ -533,8 +546,9 @@ mod tests {
     #[tokio::test]
     async fn batch_array_is_invalid_request_not_silently_dropped() {
         // MC-5: a JSON-RPC batch (array) payload must get an INVALID_REQUEST
-        // response (null id), not be silently treated as a notification — we
-        // advertise protocol versions that define batching but don't support it.
+        // response (null id), not be silently treated as a notification. Since
+        // 2024-11-05 and 2025-03-26 were retired this is unconditionally
+        // correct — no version we negotiate defines batching.
         let mut s = session();
         let d = s
             .handle_message(json!([
