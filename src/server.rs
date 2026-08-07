@@ -1,12 +1,31 @@
 //! Protocol core: per-connection [`Session`] dispatch and shared [`ServerCore`].
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde_json::{Value, json};
+use tracing::Instrument;
 
-use crate::config::ServerConfig;
+use crate::config::{ServerConfig, TransportKind};
 use crate::error::code;
 use crate::service::{CallError, McpService};
+use crate::telemetry::metrics::{self, Label};
+
+/// The `method` label used for a payload that never named a method: a batch
+/// array, a scalar, a wrong `jsonrpc` version, or a request with no `method`
+/// member.
+const METHOD_INVALID: &str = "invalid";
+
+/// The `method` label used for a method this server does not implement.
+///
+/// A caller chooses the method name, so labelling the counter with it verbatim
+/// would let a probing client fill the registry's cardinality budget and push
+/// the real methods into the overflow series. The name still reaches the span,
+/// where there is no budget to spend.
+const METHOD_OTHER: &str = "other";
+
+/// The `request_id` span field used for a notification, which has no id.
+const NO_REQUEST_ID: &str = "-";
 
 /// Immutable, shared server state: the config and the service implementation.
 /// Cheap to clone (it's behind an `Arc`); one is shared by every connection.
@@ -43,6 +62,7 @@ pub struct Dispatch {
 pub struct Session {
     core: Arc<ServerCore>,
     initialized: bool,
+    transport: TransportKind,
 }
 
 enum Outcome {
@@ -55,17 +75,63 @@ enum Outcome {
 }
 
 impl Session {
-    /// Start a fresh session bound to the shared core.
+    /// Start a fresh session bound to the shared core, served over stdio.
+    /// Use [`Self::on_transport`] for a session on another transport.
     pub fn new(core: Arc<ServerCore>) -> Self {
         Self {
             core,
             initialized: false,
+            transport: TransportKind::Stdio,
         }
+    }
+
+    /// Record which transport this session arrived on.
+    ///
+    /// The value reaches every request span, so a failing request can be told
+    /// apart from one that came through a different door. It changes nothing
+    /// about how the session behaves.
+    #[must_use]
+    pub fn on_transport(mut self, transport: TransportKind) -> Self {
+        self.transport = transport;
+        self
     }
 
     /// Handle one parsed JSON-RPC message and produce the response (if any) and
     /// any notifications to flush.
     pub async fn handle_message(&mut self, message: Value) -> Dispatch {
+        let method = message
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or(METHOD_INVALID)
+            .to_string();
+        let request_id = message
+            .get("id")
+            .map_or_else(|| NO_REQUEST_ID.to_string(), Value::to_string);
+
+        // D10: the method name, the request id and the transport are names and
+        // ids, so they belong at INFO. The params never join them.
+        let span = tracing::info_span!(
+            "mcp.request",
+            method = %method,
+            request_id = %request_id,
+            transport = %self.transport,
+        );
+        self.dispatch(message).instrument(span).await
+    }
+
+    /// Route one message and record what it cost.
+    async fn dispatch(&mut self, message: Value) -> Dispatch {
+        let started = Instant::now();
+        let (dispatch, method) = self.route(message).await;
+        let labels = [Label::new("method", method)];
+        metrics::increment("mcp.requests", &labels);
+        metrics::record_duration("mcp.request.duration", started.elapsed(), &labels);
+        dispatch
+    }
+
+    /// Handle one parsed JSON-RPC message, and report the `method` label its
+    /// counters belong under.
+    async fn route(&mut self, message: Value) -> (Dispatch, String) {
         // MC-5: a JSON-RPC payload must be a single Request/Notification object.
         // An array (batch) or any non-object scalar is not a valid Request —
         // batching was removed from the spec in 2025-06-18 and every version we
@@ -79,14 +145,17 @@ impl Session {
             } else {
                 "request must be a JSON object"
             };
-            return Dispatch {
-                response: Some(error_response(
-                    Some(Value::Null),
-                    code::INVALID_REQUEST,
-                    msg,
-                )),
-                notifications: Vec::new(),
-            };
+            return (
+                Dispatch {
+                    response: Some(error_response(
+                        Some(Value::Null),
+                        code::INVALID_REQUEST,
+                        msg,
+                    )),
+                    notifications: Vec::new(),
+                },
+                METHOD_INVALID.to_string(),
+            );
         }
 
         let id = message.get("id").cloned();
@@ -97,20 +166,26 @@ impl Session {
         if let Some(version) = message.get("jsonrpc").and_then(Value::as_str)
             && version != "2.0"
         {
-            return Self::finish(
-                is_request,
-                id,
-                Outcome::Error(
-                    code::INVALID_REQUEST,
-                    format!("invalid jsonrpc version: {version}"),
+            return (
+                Self::finish(
+                    is_request,
+                    id,
+                    Outcome::Error(
+                        code::INVALID_REQUEST,
+                        format!("invalid jsonrpc version: {version}"),
+                    ),
+                    Vec::new(),
                 ),
-                Vec::new(),
+                METHOD_INVALID.to_string(),
             );
         }
 
         let method = message.get("method").and_then(Value::as_str);
         let params = message.get("params").cloned().unwrap_or(Value::Null);
         let mut notifications = Vec::new();
+        // A method this server does not implement is a name the caller chose,
+        // so it is counted under `other` rather than under itself.
+        let mut method_label = method.unwrap_or(METHOD_INVALID).to_string();
 
         let outcome = match method {
             Some("initialize") => Outcome::Result(self.handle_initialize(&params)),
@@ -135,12 +210,19 @@ impl Session {
                 Outcome::Result(Value::Null)
             }
             Some(other) => {
+                method_label = METHOD_OTHER.to_string();
                 Outcome::Error(code::METHOD_NOT_FOUND, format!("method not found: {other}"))
             }
-            None => Outcome::Error(code::INVALID_REQUEST, "missing method".into()),
+            None => {
+                method_label = METHOD_INVALID.to_string();
+                Outcome::Error(code::INVALID_REQUEST, "missing method".into())
+            }
         };
 
-        Self::finish(is_request, id, outcome, notifications)
+        (
+            Self::finish(is_request, id, outcome, notifications),
+            method_label,
+        )
     }
 
     fn handle_initialize(&mut self, params: &Value) -> Value {
@@ -198,29 +280,65 @@ impl Session {
         };
         let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
 
-        match self.core.service.call_tool(name, &arguments).await {
-            Ok(reply) => {
-                if reply.tools_list_changed {
-                    notifications.push(json!({
-                        "jsonrpc": "2.0",
-                        "method": "notifications/tools/list_changed",
-                    }));
+        // The tool name is a name, so it belongs at INFO and on the span. The
+        // arguments are content — file paths, command lines, search text — so
+        // D10 keeps them off both, and puts them on a DEBUG line instead.
+        let span = tracing::info_span!("mcp.tools.call", tool = %name);
+        async move {
+            tracing::debug!(arguments = %arguments, "tool call arguments");
+            let started = Instant::now();
+            let result = self.core.service.call_tool(name, &arguments).await;
+            let outcome = match &result {
+                Ok(_) => "ok",
+                Err(CallError::Internal(_)) => "error",
+                Err(CallError::Tool(_) | CallError::InvalidParams(_)) => "tool_error",
+            };
+            // The tool name is chosen by the caller, so the registry's
+            // cardinality cap is what bounds this series.
+            metrics::increment(
+                "mcp.tools.call",
+                &[Label::new("tool", name), Label::new("outcome", outcome)],
+            );
+            metrics::record_duration(
+                "mcp.tools.call.duration",
+                started.elapsed(),
+                &[Label::new("tool", name)],
+            );
+
+            match result {
+                Ok(reply) => {
+                    if reply.tools_list_changed {
+                        notifications.push(json!({
+                            "jsonrpc": "2.0",
+                            "method": "notifications/tools/list_changed",
+                        }));
+                    }
+                    Outcome::Result(reply.to_result_json())
                 }
-                Outcome::Result(reply.to_result_json())
+                // Tool failures are a successful response with isError content.
+                //
+                // Why InvalidParams lands here too (SEP-1303): bad arguments are
+                // something the model supplied and can correct, so it has to see
+                // them. A JSON-RPC error is invisible to the model and takes the
+                // turn with it. Only faults the model cannot act on stay protocol
+                // errors — a malformed request (no tool name, above) and an
+                // internal server fault (below).
+                //
+                // A tool that declines is a normal outcome, not a fault, so it
+                // is reported at DEBUG. Its message can quote the arguments,
+                // which is the other reason it cannot go higher.
+                Err(CallError::Tool(msg) | CallError::InvalidParams(msg)) => {
+                    tracing::debug!(reason = %msg, "tool returned an error result");
+                    Outcome::Result(tool_error_result(&msg))
+                }
+                Err(CallError::Internal(msg)) => {
+                    tracing::error!(error = %msg, "tool call failed");
+                    Outcome::Error(code::INTERNAL_ERROR, msg)
+                }
             }
-            // Tool failures are a successful response with isError content.
-            //
-            // Why InvalidParams lands here too (SEP-1303): bad arguments are
-            // something the model supplied and can correct, so it has to see
-            // them. A JSON-RPC error is invisible to the model and takes the
-            // turn with it. Only faults the model cannot act on stay protocol
-            // errors — a malformed request (no tool name, above) and an
-            // internal server fault (below).
-            Err(CallError::Tool(msg) | CallError::InvalidParams(msg)) => {
-                Outcome::Result(tool_error_result(&msg))
-            }
-            Err(CallError::Internal(msg)) => Outcome::Error(code::INTERNAL_ERROR, msg),
         }
+        .instrument(span)
+        .await
     }
 
     fn tools_json(&self) -> Value {

@@ -6,10 +6,8 @@
 
 mod support;
 
-use std::sync::Arc;
-
 use mcp_core::telemetry::metrics::{self, Label};
-use mcp_core::{ServerCore, Session, TransportKind};
+use mcp_core::{Session, TransportKind};
 use serde_json::{Value, json};
 
 use support::{capture, demo_core};
@@ -106,23 +104,21 @@ fn request_span_carries_the_transport_kind() {
     );
 }
 
-/// Drive messages through one session, without capturing anything.
+/// Drive messages through one session.
+///
+/// This goes through the capturing subscriber even though the assertions are
+/// about metrics. `tracing` caches per-callsite interest across the whole
+/// process, so one test that reaches a span callsite with no subscriber
+/// installed can cache it as disabled and starve a test running beside it.
+/// Every test in this binary therefore keeps a subscriber in scope.
 fn drive(messages: &[Value]) {
     let messages = messages.to_vec();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("a current-thread runtime");
-    runtime.block_on(async move {
-        let mut session = Session::new(core());
+    capture(|| async move {
+        let mut session = Session::new(demo_core());
         for message in messages {
             session.handle_message(message).await;
         }
     });
-}
-
-fn core() -> Arc<ServerCore> {
-    demo_core()
 }
 
 /// The lifetime total of one counter series, or zero when it has never been

@@ -105,6 +105,7 @@ pub mod error;
 mod runner;
 mod server;
 pub mod service;
+pub mod telemetry;
 pub mod transport;
 
 pub use args::CommonServeArgs;
