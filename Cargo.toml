@@ -20,6 +20,10 @@ tokio = { version = "1.48", features = [
     "rt",
     "rt-multi-thread",
     "net",
+    # `signal` is what lets `run` stop on SIGTERM or SIGINT and flush the
+    # telemetry the exporters still hold. It resolves two extra crates,
+    # `signal-hook-registry` and `errno`.
+    "signal",
     "sync",
 ] }
 # WebSocket transport (optional — disable default features to drop axum entirely).

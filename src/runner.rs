@@ -344,6 +344,18 @@ async fn ws_connection(socket: axum::extract::ws::WebSocket, core: Arc<ServerCor
 /// Logs go to stderr, at `info` unless `RUST_LOG` says otherwise. The `otel`
 /// feature adds OTLP export beside them, configured from the standard `OTEL_*`
 /// environment variables.
+///
+/// # Stopping
+///
+/// For the same reason, this is the one place that listens for `SIGTERM` and
+/// `SIGINT`. Either one ends the serve loop and returns `Ok(())`, which drops
+/// the telemetry guard and flushes what the exporters were holding. Without it a
+/// signalled process runs no destructor and loses that buffer, which is the
+/// window an operator most wants after a restart.
+///
+/// Open connections are cut rather than drained, [`crate::McpService::shutdown`]
+/// is not called, and the process exits 0. [`crate::shutdown`] records why for
+/// each, and covers what a server that calls [`serve`] directly does instead.
 pub async fn run<L, S, Build, Fut>(config: crate::config::ServerConfig, build: Build) -> Result<()>
 where
     L: clap::Args,
@@ -385,11 +397,44 @@ where
     // before the service is built, so a failure there is reported. The guard
     // lives for the rest of `run`; dropping it flushes the exporters, and a
     // process that exits without that loses whatever they had buffered.
-    let _telemetry = crate::telemetry::init(crate::telemetry::Config::new(config.name.clone()))?;
+    let telemetry = crate::telemetry::init(crate::telemetry::Config::new(config.name.clone()))?;
 
-    let service = build(local).await?;
-    let core = ServerCore::new(config, Arc::new(service));
-    serve(core, &common).await
+    // Before the service is built, so a signal that arrives while `build` is
+    // still working is remembered rather than fatal.
+    let mut stop = crate::shutdown::StopSignals::install()?;
+
+    let served = async {
+        let service = build(local).await?;
+        let core = ServerCore::new(config, Arc::new(service));
+        serve(core, &common).await
+    };
+
+    let signal = tokio::select! {
+        // The server ended on its own. `telemetry` drops as this returns, which
+        // is the flush that has always worked.
+        result = served => return result,
+        signal = stop.recv() => signal,
+    };
+    tracing::info!(%signal, "stopping");
+
+    // Flush here rather than leaving it to a destructor, because the exit below
+    // runs none. This is the whole point of catching the signal: a process the
+    // signal killed would have dropped nothing.
+    drop(telemetry);
+
+    // Why the process ends here instead of returning to the server's `main`:
+    // `tokio::io::stdin` reads on a blocking task, and dropping the read future
+    // does not end the read. The runtime's own shutdown then waits for that read
+    // forever, because the peer is still holding the pipe open. A stdio server
+    // would flush its telemetry and then hang until something killed it, which
+    // is worse than the loss this repairs.
+    //
+    // `run` may do this. It is the process entry point by contract, and it
+    // already ends the process on `--help`, `--version` and a bad argument,
+    // where clap exits inside `get_matches`. A server that needs to do its own
+    // work after the serve loop takes `serve` instead and owns its own stop, for
+    // which `crate::shutdown::StopSignals` is public.
+    std::process::exit(0);
 }
 
 /// Like [`run`], but for servers with no extra CLI flags — the common case.

@@ -22,7 +22,9 @@ use std::time::{Duration, Instant};
 /// collector.
 const STOP_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// How long to wait for a line to appear on the probe's stderr.
+/// How long to wait for a line to appear on the probe's stderr. Only the
+/// transports that have no stdin to drive wait for one.
+#[cfg(any(feature = "unix", feature = "websocket"))]
 const READY_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The line the telemetry guard writes when it closes the last window. Its
@@ -403,6 +405,7 @@ impl StderrTail {
     }
 
     /// Block until `needle` appears on stderr, and fail the test if it does not.
+    #[cfg(any(feature = "unix", feature = "websocket"))]
     fn wait_for(&self, needle: &str, within: Duration) {
         let deadline = Instant::now() + within;
         loop {
