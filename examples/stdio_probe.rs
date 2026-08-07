@@ -1,12 +1,16 @@
-//! A minimal stdio MCP server, used by the acceptance tests to prove what
-//! really reaches file descriptor 1.
+//! A minimal MCP server, used by the acceptance tests to prove what a real
+//! process does.
 //!
 //! A capture writer proves what a layer was told to do. Only a real process
-//! proves what arrived on stdout, and stdout is where the stdio transport
-//! frames JSON-RPC, so the difference is the whole point of the check.
+//! proves what arrived on file descriptor 1, and what a process that the
+//! operating system stopped got as far as writing. Both are the whole point of
+//! the checks that drive this binary.
 //!
 //! Run it as `stdio_probe serve` and feed newline-delimited JSON-RPC on stdin.
+//! `--transport unix` and `--transport websocket` serve the same tools over the
+//! other two transports.
 
+use mcp_core::telemetry::metrics;
 use mcp_core::{CallError, McpService, ServerConfig, ToolDef, ToolReply};
 use serde_json::{Value, json};
 
@@ -43,6 +47,15 @@ impl McpService for Probe {
 
 #[tokio::main]
 async fn main() -> mcp_core::Result<()> {
-    let config = ServerConfig::new("stdio-probe", env!("CARGO_PKG_VERSION"));
-    mcp_core::run_simple(config, || async { Ok(Probe) }).await
+    let config = ServerConfig::new("stdio-probe", env!("CARGO_PKG_VERSION"))
+        .with_unix()
+        .with_websocket();
+    mcp_core::run_simple(config, || async {
+        // The metrics summary is only written when it has something to report,
+        // so a transport that serves no request would leave the flush with
+        // nothing to prove.
+        metrics::increment("probe.starts", &[]);
+        Ok(Probe)
+    })
+    .await
 }
