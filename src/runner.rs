@@ -344,6 +344,29 @@ async fn ws_connection(socket: axum::extract::ws::WebSocket, core: Arc<ServerCor
 /// Logs go to stderr, at `info` unless `RUST_LOG` says otherwise. The `otel`
 /// feature adds OTLP export beside them, configured from the standard `OTEL_*`
 /// environment variables.
+///
+/// # Stopping
+///
+/// For the same reason, this is the one place that listens for `SIGTERM` and
+/// `SIGINT`. Either one ends the serve loop, flushes the telemetry guard, and
+/// ends the process with status 0. Without it a signalled process runs no
+/// destructor and loses whatever the exporters had buffered, which is the window
+/// an operator most wants after a restart.
+///
+/// **On a signal this function does not return.** Nothing after `run(...).await`
+/// in a `main` runs, and no destructor runs anywhere in the process. A server
+/// with cleanup of its own to do must drive [`serve`] instead and own its stop,
+/// for which [`crate::shutdown`] is public. `run` already ends the process on
+/// three other paths, where clap exits inside `get_matches` for `--help`,
+/// `--version` and a bad argument.
+///
+/// It still returns on the other path. A client that ends the session gives back
+/// whatever the serve loop returned, `Ok(())` or an error, and the guard drops as
+/// it goes.
+///
+/// Open connections are cut rather than drained and
+/// [`crate::McpService::shutdown`] is not called. [`crate::shutdown`] records why
+/// for each, together with what the stop costs and how long it takes.
 pub async fn run<L, S, Build, Fut>(config: crate::config::ServerConfig, build: Build) -> Result<()>
 where
     L: clap::Args,
@@ -382,14 +405,32 @@ where
         .map_err(|e| Error::Config(format!("argument parsing: {e}")))?;
 
     // After argument parsing, so `--help` and `--version` install nothing, and
-    // before the service is built, so a failure there is reported. The guard
-    // lives for the rest of `run`; dropping it flushes the exporters, and a
-    // process that exits without that loses whatever they had buffered.
-    let _telemetry = crate::telemetry::init(crate::telemetry::Config::new(config.name.clone()))?;
+    // before the service is built, so a failure there is reported. Dropping the
+    // guard is what flushes the exporters, and a process that exits without that
+    // loses whatever they had buffered, so both ways out of `run` below drop it.
+    let telemetry = crate::telemetry::init(crate::telemetry::Config::new(config.name.clone()))?;
 
-    let service = build(local).await?;
-    let core = ServerCore::new(config, Arc::new(service));
-    serve(core, &common).await
+    // Before the service is built, so a signal that arrives while `build` is
+    // still working is remembered rather than fatal.
+    let mut stop = crate::shutdown::StopSignals::install()?;
+
+    let served = async {
+        let service = build(local).await?;
+        let core = ServerCore::new(config, Arc::new(service));
+        serve(core, &common).await
+    };
+
+    let signal = tokio::select! {
+        // `biased` so a serve loop that ends in the same poll as a signal still
+        // reports its own result. Without it the two race, and a server that
+        // failed could exit 0.
+        biased;
+        // The server ended on its own. `telemetry` drops as this returns, which
+        // is the flush that has always worked.
+        result = served => return result,
+        signal = stop.recv() => signal,
+    };
+    crate::shutdown::flush_and_exit(signal, telemetry);
 }
 
 /// Like [`run`], but for servers with no extra CLI flags — the common case.

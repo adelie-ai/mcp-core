@@ -10,10 +10,12 @@ server's domain logic. Transports past stdio are feature-gated: `unix` is on by 
 `websocket` pulls in axum, and `auth` adds JWT / JWKS bearer validation on top of `websocket`.
 A new optional dependency stays behind its feature so a stdio-only server never compiles it.
 
-`mcp-core` also owns the process telemetry subscriber for the fleet: the `run` entry point
-installs it from `adelie-telemetry`, and instruments the JSON-RPC dispatch path with spans
-and metrics. Only `run` installs one. A server library hosted inside another binary must
-inherit that binary's subscriber, never install a second.
+`mcp-core` also owns the process lifecycle for the fleet, and `run` is the one place that
+owns it. `run` installs the telemetry subscriber from `adelie-telemetry`, instruments the
+JSON-RPC dispatch path with spans and metrics, and listens for the signals that stop a
+server so the subscriber is flushed before the process exits. Everything process-global
+lives there and nowhere else. A server library hosted inside another binary inherits that
+binary's subscriber and that binary's signal handling, and installs neither.
 
 Warnings are denied mechanically - `[lints] rust.warnings = "deny"` and `clippy.all = "deny"`
 in `Cargo.toml` - so `cargo build` / `test` / `clippy` hard-fail on any warning.

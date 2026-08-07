@@ -3,7 +3,7 @@ name = "mcp-core"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "Shared core for the adelie-ai hand-rolled MCP servers: JSON-RPC 2.0 protocol/dispatch, stdio/websocket/unix transports, a standard Clap CLI with a per-server extension hook, and the process telemetry subscriber that its runner installs."
+description = "Shared core for the adelie-ai hand-rolled MCP servers: JSON-RPC 2.0 protocol/dispatch, stdio/websocket/unix transports, a standard Clap CLI with a per-server extension hook, and the process lifecycle its runner owns - the telemetry subscriber, and the stop signals that flush it."
 repository = "https://github.com/adelie-ai/mcp-core"
 
 [dependencies]
@@ -20,6 +20,10 @@ tokio = { version = "1.48", features = [
     "rt",
     "rt-multi-thread",
     "net",
+    # `signal` is what lets `run` stop on SIGTERM or SIGINT and flush the
+    # telemetry the exporters still hold. It resolves two extra crates,
+    # `signal-hook-registry` and `errno`.
+    "signal",
     "sync",
 ] }
 # WebSocket transport (optional — disable default features to drop axum entirely).
