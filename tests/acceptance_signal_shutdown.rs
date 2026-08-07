@@ -255,6 +255,41 @@ fn a_clean_eof_still_flushes_the_final_metrics_summary() {
     );
 }
 
+/// A real failure still fails, and still flushes.
+///
+/// Racing the serve loop against a signal must not turn a transport error into
+/// a clean exit. An oversize declared frame ends the connection, and the process
+/// has to say so with a non-zero status while still writing its summary.
+#[test]
+fn a_transport_failure_still_exits_non_zero_and_still_flushes() {
+    let mut probe = Probe::start(&["serve"], Stdio::piped());
+    {
+        let stdin = probe
+            .child
+            .stdin
+            .as_mut()
+            .expect("the probe has a piped stdin");
+        stdin
+            .write_all(b"Content-Length: 9999999999\r\n\r\n")
+            .expect("the probe must accept its input");
+    }
+    drop(probe.child.stdin.take());
+
+    let stopped = probe.finish();
+    assert_eq!(
+        stopped.status.code(),
+        Some(1),
+        "a framing error must still exit non-zero; status was {:?}, stderr was {:?}",
+        stopped.status,
+        stopped.stderr
+    );
+    assert!(
+        stopped.stderr.contains(SUMMARY),
+        "a failing server must still write the final metrics summary, but stderr was: {:?}",
+        stopped.stderr
+    );
+}
+
 /// Start a stdio probe, drive one request through it so the metrics registry
 /// has something in it, then stop it with `signal_name`.
 fn stdio_probe_stopped_by(signal_name: &str) -> Stopped {
