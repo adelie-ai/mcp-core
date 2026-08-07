@@ -223,17 +223,17 @@ and costs nothing at all.
 
 ### When the exporters flush
 
-The OTLP exporters buffer, and they flush when `run` returns. `run` returns for
-two reasons, and both flush.
+The OTLP exporters buffer, and they flush when `run` stops. `run` stops for two
+reasons, and both flush.
 
 The **client ends the session**. Over stdio it closes the stream, over unix and
-websocket it closes the connection. The buffer goes out, and the process exits
-with whatever `run` returned.
+websocket it closes the connection. The buffer goes out, `run` returns whatever
+the serve loop returned, and the process exits normally.
 
 The **process is asked to stop**, with `SIGTERM` or `SIGINT`. `run` ends the
-serve loop, flushes, and exits 0. This works over all three transports, and it
-is what makes a rolling deployment keep the window it was in: Kubernetes stops
-every pod with `SIGTERM`.
+serve loop, flushes, and ends the process with status 0 without returning. This
+works over all three transports, and it is what makes a rolling deployment keep
+the window it was in: Kubernetes stops every pod with `SIGTERM`.
 
 Console output and the periodic metrics summary are unaffected either way,
 because both are written as they happen rather than buffered.
@@ -253,39 +253,65 @@ dying with its terminal instead of surviving it.
 |---|---|
 | In-flight requests | Cut, not drained. The process is going away inside the grace period, and a client already handles a transport that closes under it. |
 | `McpService::shutdown` | Not called. It is a de-initialize hook driven by a client `shutdown` request, after which the session keeps serving. |
-| Exit status | `0`. Kubernetes reports the container as Completed, and systemd counts exit 0 as success. |
+| Destructors | None run, including any `Drop` on the service. The telemetry guard is flushed by hand for this reason. |
+| The unix socket file | Left behind. A killed process left one too, and the next bind unlinks a stale socket. |
+| Exit status | `0`. Kubernetes reports the container as Completed, and systemd counts exit 0 as success. It would also read as success for a Job or `restartPolicy: OnFailure`; no server here runs that way. |
 | `SIGINT` | The same as `SIGTERM`, in every respect. |
 | Where the handler lives | `run`, and nowhere else. `serve` is a plain library call and installs nothing. |
 
-Stopping adds no wait of its own. The flush is bounded by the telemetry guard's
-shutdown budget, five seconds by default, well inside the 30-second Kubernetes
-default grace period. A second signal that arrives during the flush is absorbed:
-it neither shortens the budget nor ends the process early, so a second Ctrl-C
-looks ignored for as long as the flush takes.
+Installing does replace an inherited `SIG_IGN` for both signals. A shell without
+job control ignores `SIGINT` in a backgrounded child, so `sh -c 'some-mcp serve
+&'` now stops on Ctrl-C where it used to survive. That is the cost of the ticket
+asking for `SIGINT`, and it is why `SIGHUP` is refused: `nohup` exists to make a
+server outlive its terminal, and handling `SIGHUP` would take that away for
+nothing in return.
 
-`run` ends the process itself once the flush is done, rather than returning to
-`main`. `tokio::io::stdin` reads on a blocking task, and dropping that read does
-not end it, so the runtime's own shutdown would wait for a stdin read that the
-peer is still holding open. A stdio server would flush and then hang. `run` is
-the process entry point by contract and already ends the process on `--help`,
-`--version` and a bad argument, where clap exits inside `get_matches`.
+### How long a stop takes
+
+The stop path adds no wait of its own, but it is not free. It waits for the
+flush, and the flush is bounded by the telemetry guard's shutdown budget: five
+seconds by default, and **not configurable** from a server that uses `run`. That
+is well inside the 30-second Kubernetes default grace period.
+
+- No collector configured, or a collector that answers: about ten milliseconds.
+- A collector whose packets are dropped rather than refused: the whole budget.
+  Measured at 5.1 seconds, with the metrics summary written at once and a warning
+  that the pipelines had not shut down in time.
+- A refused connection: no wait at all.
+
+A second signal that arrives during the flush is absorbed. It neither shortens
+the budget nor ends the process early, so a second Ctrl-C looks ignored for as
+long as the flush takes.
+
+### Why `run` ends the process
+
+`run` does not return on the signal path. Nothing after `run(...).await` in a
+`main` runs, and no destructor runs anywhere. `tokio::io::stdin` reads on a
+blocking task, and dropping that read does not end it, so the runtime's own
+shutdown would wait for a stdin read that the peer is still holding open, and a
+stdio server would flush and then hang. `run` is the process entry point by
+contract and already ends the process on `--help`, `--version` and a bad
+argument, where clap exits inside `get_matches`. A server with cleanup of its own
+to do drives `serve` instead.
 
 A server that owns its own `main` and calls `serve` gets none of this, by
-design, and wires it itself. Both steps after the select matter: the flush has
-to happen there because the exit runs no destructor, and the exit has to happen
-at all because a returning stdio server hangs.
+design, and wires it itself. `shutdown::flush_and_exit` carries the part whose
+order is load bearing, so the server writes the install and the race only:
 
 ```rust
+use mcp_core::{shutdown, telemetry};
+
 let telemetry = telemetry::init(telemetry::Config::new("example-mcp"))?;
-let mut stop = mcp_core::shutdown::StopSignals::install()?;
+
+// Install before serving. A signal that arrives before this is still fatal.
+let mut stop = shutdown::StopSignals::install()?;
 
 let signal = tokio::select! {
+    biased;
     result = mcp_core::serve(core, &args) => return result,
     signal = stop.recv() => signal,
 };
-tracing::info!(%signal, "stopping");
-drop(telemetry);
-std::process::exit(0);
+shutdown::flush_and_exit(signal, telemetry)
 ```
 
 Which transport to choose, what each one trusts for TLS, and what a container
@@ -304,6 +330,11 @@ cargo test
 
 cargo clippy --all-targets --features otel -- -D warnings
 cargo test --features otel
+
+# The websocket transport is off by default, so its tests are compiled out of
+# the run above. `auth` implies it.
+cargo clippy --all-targets --features auth -- -D warnings
+cargo test --features auth
 ```
 
 `Cargo.toml` denies warnings mechanically, so a plain `cargo build` fails on

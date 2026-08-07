@@ -43,6 +43,12 @@ fn sigterm_over_stdio_flushes_the_final_metrics_summary() {
 }
 
 /// AC: `SIGINT` behaves the same way as `SIGTERM`.
+///
+/// One transport is enough for this one. The signal and the transport are
+/// orthogonal in the code: both signals resolve the same `select!` arm, and what
+/// follows knows nothing about which transport was serving. `SIGTERM` covers all
+/// three transports, and this covers both signals, so the pair crosses the whole
+/// surface without a test per combination.
 #[test]
 fn sigint_over_stdio_flushes_the_final_metrics_summary() {
     let stderr = stdio_probe_stopped_by("INT").stderr;
@@ -85,8 +91,11 @@ fn a_signalled_server_exits_zero_rather_than_dying_by_signal() {
 
 /// AC: two signals in quick succession neither panic nor flush twice.
 ///
-/// The second signal arrives while the first is still flushing. Nothing may
-/// shut a pipeline down a second time, and the process must still stop.
+/// Whether the second signal lands during the flush or just after it depends on
+/// how long the flush takes, and with no collector configured that is a fraction
+/// of a millisecond. This test does not control which of the two happens, so it
+/// asserts what must hold either way: the process still exits 0, nothing panics,
+/// and exactly one summary is written.
 #[test]
 fn a_second_signal_during_shutdown_neither_panics_nor_double_flushes() {
     let mut probe = Probe::start(&["serve"], Stdio::piped());
@@ -130,18 +139,16 @@ fn a_second_signal_during_shutdown_neither_panics_nor_double_flushes() {
 /// handler corrupts the stream for the client that is still reading it.
 #[test]
 fn the_stop_path_writes_nothing_to_stdout() {
+    // `request` already read the one reply the server owed, so everything here
+    // is what the stop path added. It has to be nothing at all: a stray line
+    // that happened to parse as JSON would corrupt the stream just as surely as
+    // one that did not.
     let stopped = stdio_probe_stopped_by("TERM");
-    for line in stopped
-        .stdout
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-    {
-        let parsed: Result<serde_json::Value, _> = serde_json::from_str(line);
-        assert!(
-            parsed.is_ok(),
-            "every stdout line must still be JSON-RPC after a signal, but {line:?} is not"
-        );
-    }
+    assert!(
+        stopped.stdout.is_empty(),
+        "the stop path must write nothing to stdout, but it wrote: {:?}",
+        stopped.stdout
+    );
 }
 
 /// AC: a server stopped by `SIGTERM` over the unix transport flushes its
@@ -153,7 +160,7 @@ fn the_stop_path_writes_nothing_to_stdout() {
 #[test]
 fn sigterm_over_unix_flushes_the_final_metrics_summary() {
     let socket = temp_socket_path("unix-flush");
-    let probe = Probe::start(
+    let mut probe = Probe::start(
         &[
             "serve",
             "--transport",
@@ -163,7 +170,7 @@ fn sigterm_over_unix_flushes_the_final_metrics_summary() {
         ],
         Stdio::null(),
     );
-    probe.stderr.wait_for("listening", READY_TIMEOUT);
+    probe.wait_until_listening();
 
     // One real request, so the summary has something in it to lose.
     {
@@ -209,11 +216,11 @@ fn sigterm_over_unix_flushes_the_final_metrics_summary() {
 #[test]
 fn sigterm_over_websocket_flushes_the_final_metrics_summary() {
     // Port 0 takes whatever is free, so parallel runs never collide.
-    let probe = Probe::start(
+    let mut probe = Probe::start(
         &["serve", "--transport", "websocket", "--port", "0"],
         Stdio::null(),
     );
-    probe.stderr.wait_for("listening", READY_TIMEOUT);
+    probe.wait_until_listening();
 
     probe.signal("TERM");
     let stopped = probe.finish();
@@ -257,9 +264,11 @@ fn a_clean_eof_still_flushes_the_final_metrics_summary() {
 
 /// A real failure still fails, and still flushes.
 ///
-/// Racing the serve loop against a signal must not turn a transport error into
-/// a clean exit. An oversize declared frame ends the connection, and the process
-/// has to say so with a non-zero status while still writing its summary.
+/// The `select!` that races the serve loop against a signal put a second exit
+/// path into `run`. No signal is sent here: the point is that the first path
+/// still works, and that racing it did not turn a transport error into a clean
+/// exit. An oversize declared frame ends the connection, and the process has to
+/// say so with a non-zero status while still writing its summary.
 #[test]
 fn a_transport_failure_still_exits_non_zero_and_still_flushes() {
     let mut probe = Probe::start(&["serve"], Stdio::piped());
@@ -319,7 +328,7 @@ impl Probe {
         let binary = probe_binary();
         assert!(
             binary.is_file(),
-            "the stdio probe example must be built before this test can prove anything; \
+            "the probe example must be built before this test can prove anything; \
              expected it at {}",
             binary.display()
         );
@@ -357,6 +366,43 @@ impl Probe {
             reply.contains("\"result\""),
             "the probe must be serving before it is signalled, but replied {reply:?}"
         );
+    }
+
+    /// Block until the probe reports that it is listening.
+    ///
+    /// This watches the process as well as the stream. A probe that stops before
+    /// it listens has written the reason on its stderr, and reporting that reason
+    /// at once beats waiting out the timeout to say nothing. The reason is
+    /// usually a probe built with different features from this test, which is
+    /// what `cargo test --test <name>` leaves behind: it reuses the example
+    /// binary on disk and never rebuilds it.
+    #[cfg(any(feature = "unix", feature = "websocket"))]
+    fn wait_until_listening(&mut self) {
+        let deadline = Instant::now() + READY_TIMEOUT;
+        loop {
+            let seen = self.stderr.snapshot();
+            if seen.contains("listening") {
+                return;
+            }
+            if let Some(status) = self
+                .child
+                .try_wait()
+                .expect("the probe's state must be readable")
+            {
+                panic!(
+                    "the probe stopped with {status:?} before it listened, so this test never \
+                     ran. Its own report was: {seen:?}. A missing feature there means the \
+                     example binary on disk was built with different features from this test; \
+                     run `cargo test`, which rebuilds it."
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the probe never reported listening within {READY_TIMEOUT:?}; \
+                 what it did write was: {seen:?}"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn pid(&self) -> u32 {
@@ -436,24 +482,6 @@ impl StderrTail {
         Self {
             text,
             reader: Some(reader),
-        }
-    }
-
-    /// Block until `needle` appears on stderr, and fail the test if it does not.
-    #[cfg(any(feature = "unix", feature = "websocket"))]
-    fn wait_for(&self, needle: &str, within: Duration) {
-        let deadline = Instant::now() + within;
-        loop {
-            let seen = self.snapshot();
-            if seen.contains(needle) {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "the probe never wrote {needle:?} to stderr within {within:?}; \
-                 what it did write was: {seen:?}"
-            );
-            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
