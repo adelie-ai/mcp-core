@@ -93,7 +93,7 @@ impl std::fmt::Display for Safe<'_> {
 
         let mut written = 0;
         for character in self.value.chars() {
-            let safe = if is_line_breaking(character) {
+            let safe = if is_deceptive(character) {
                 REPLACEMENT
             } else {
                 character
@@ -109,13 +109,50 @@ impl std::fmt::Display for Safe<'_> {
     }
 }
 
-/// Whether this character could end a log line or move a cursor.
+/// Whether this character could make a field render as something other than
+/// what it is.
 ///
-/// `char::is_control` covers C0, C1 and DEL. It does not cover U+2028 LINE
-/// SEPARATOR or U+2029 PARAGRAPH SEPARATOR, which are categories Zl and Zp and
-/// which some log viewers, and every JSON consumer, treat as a line break.
-fn is_line_breaking(character: char) -> bool {
-    character.is_control() || character == '\u{2028}' || character == '\u{2029}'
+/// Three kinds, and each defeats a different reader.
+///
+/// - `char::is_control` covers C0, C1 and DEL. Those end a line or drive a
+///   terminal.
+/// - U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR are categories Zl
+///   and Zp. `is_control` does not cover them, and some log viewers, and every
+///   JSON consumer, treat them as a line break.
+/// - The bidi controls leave the bytes alone and reverse what a person sees,
+///   so a name renders as something it is not. This is the trojan-source
+///   class, and the set is the one rustc's own
+///   `text_direction_codepoint_in_literal` lint covers.
+///
+/// The wider Cf category is deliberately not swept. A zero-width joiner is Cf
+/// and carries the emoji sequences a person does want to read, and hiding text
+/// is a weaker problem than reversing it.
+fn is_deceptive(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{2028}'
+                | '\u{2029}'
+                | '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
+}
+
+/// A JSON value as a log field, rendered only if a subscriber asks for it.
+///
+/// A JSON rendering escapes the C0 controls on its own, which is what made
+/// this path look safe. It does not escape U+2028, U+2029 or a bidi control,
+/// and it bounds nothing, so it goes through [`Safe`] like any other value a
+/// caller reaches.
+struct SafeJson<'a>(&'a Value);
+
+impl std::fmt::Display for SafeJson<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", Safe::message(&self.0.to_string()))
+    }
 }
 
 /// A JSON-RPC id as a span field, rendered only if a subscriber asks for it.
@@ -391,7 +428,7 @@ impl Session {
         // D10 keeps them off both, and puts them on a DEBUG line instead.
         let span = tracing::info_span!("mcp.tools.call", tool = %Safe::name(name));
         async move {
-            tracing::debug!(arguments = %arguments, "tool call arguments");
+            tracing::debug!(arguments = %SafeJson(&arguments), "tool call arguments");
             let started = Instant::now();
             let result = self.core.service.call_tool(name, &arguments).await;
             let outcome = match &result {

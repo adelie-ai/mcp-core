@@ -277,8 +277,43 @@ fn internal_tool_failure_keeps_its_message_off_the_error_line() {
     );
 }
 
+/// Characters that make a log field render as something other than what it is.
+///
+/// Three kinds, and each defeats a different reader. `\n` and `\u{1b}` end a
+/// line and drive a terminal. U+2028 and U+2029 are categories Zl and Zp, which
+/// `char::is_control` does not cover and which many log viewers, and every JSON
+/// consumer, treat as a line break. U+202E and U+2066 are bidi controls: they
+/// leave the bytes alone and reverse what a person sees, which is the
+/// trojan-source class.
+const DECEPTIVE: &[(char, &str)] = &[
+    ('\n', "line feed"),
+    ('\u{1b}', "escape"),
+    ('\u{2028}', "line separator"),
+    ('\u{2029}', "paragraph separator"),
+    ('\u{202e}', "right-to-left override"),
+    ('\u{2066}', "left-to-right isolate"),
+];
+
+/// Every one of them, in one string, for a payload that must come back clean.
+fn deceptive_payload() -> String {
+    DECEPTIVE.iter().map(|(c, _)| *c).collect()
+}
+
+/// Assert that nothing a caller sent can change how a field renders.
+fn assert_no_deception(owner: &str, key: &str, value: &str) {
+    for (character, name) in DECEPTIVE {
+        assert!(
+            !value.contains(*character),
+            "{owner} field {key:?} carries a {name} (U+{:04X}), which lets a caller change \
+             what a reader sees: {value:?}",
+            *character as u32
+        );
+    }
+}
+
 /// A caller chooses the method name, the tool name and the request id. None of
-/// them may end a log line, drive a terminal, or grow without a bound.
+/// them may end a log line, drive a terminal, reverse what a reader sees, or
+/// grow without a bound.
 ///
 /// The console layer writes a field value straight into a line, so a newline in
 /// one produces what reads as a second genuine line, with a real timestamp
@@ -287,7 +322,12 @@ fn internal_tool_failure_keeps_its_message_off_the_error_line() {
 /// leaves the process as a span attribute.
 #[test]
 fn caller_supplied_names_cannot_forge_a_log_line() {
-    let forged = "x\n2026-08-07T00:00:00.000000Z  INFO mcp_core: authentication disabled\u{1b}[31m";
+    let forged = format!(
+        "x{}2026-08-07T00:00:00.000000Z  INFO mcp_core: authentication disabled{}[31m",
+        deceptive_payload(),
+        '\u{1b}'
+    );
+    let forged = forged.as_str();
     let long = "l".repeat(4096);
 
     let recorded = capture_dispatch(&[
@@ -325,20 +365,14 @@ fn caller_supplied_names_cannot_forge_a_log_line() {
         }));
 
     for (owner, key, value) in everything {
-        assert!(
-            !value
-                .chars()
-                .any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}'),
-            "{owner} field {key:?} carries a character that can end a log line or drive a \
-             terminal: {value:?}"
-        );
+        assert_no_deception(owner, key, value);
     }
 
-    // A span field is capped as well. It is exported verbatim with `otel` on,
-    // and the transport cap is measured in megabytes, so an uncapped one lets
-    // one request ship as much as it likes. The DEBUG arguments line is
-    // deliberately not capped: an operator who raises the level wants the whole
-    // value.
+    // A span field is capped tightly, because a name is short by nature. It is
+    // exported verbatim with `otel` on, and the transport cap is measured in
+    // megabytes, so an uncapped one lets one request ship as much as it likes.
+    // The DEBUG arguments line carries the wider message cap, which
+    // `tool_arguments_cannot_forge_a_log_line` holds.
     for span in &recorded.spans {
         for (key, value) in &span.fields {
             assert!(
@@ -348,6 +382,66 @@ fn caller_supplied_names_cannot_forge_a_log_line() {
                 value.len()
             );
         }
+    }
+}
+
+/// The DEBUG arguments line is a caller's payload, and it gets the same
+/// treatment as every other value a caller reaches.
+///
+/// A JSON rendering escapes the C0 controls on its own, which is why this path
+/// looked safe. It does not escape U+2028 or U+2029, and it does not escape a
+/// bidi control, so a `tools/call` could still forge a record. `RUST_LOG=debug`
+/// is the mode the whole diagnostic story rests on, and D4 ships it to the
+/// collector deliberately, so a forged record there reaches the backend.
+///
+/// Size is the other half. Every other caller-influenced field is capped, and
+/// an uncapped one lets a single request export its whole params blob.
+#[test]
+fn tool_arguments_cannot_forge_a_log_line() {
+    let recorded = capture_dispatch(&[
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "echo",
+                "arguments": {
+                    "forged": format!(
+                        "x{}2026-08-07T00:00:00.000000Z  INFO mcp_core: all clear",
+                        deceptive_payload(),
+                    ),
+                    "bulk": "b".repeat(64 * 1024),
+                },
+            },
+        }),
+    ]);
+
+    let arguments: Vec<(&str, &String)> = recorded
+        .events
+        .iter()
+        .filter_map(|event| {
+            event
+                .fields
+                .get("arguments")
+                .map(|value| ("<event>", value))
+        })
+        .collect();
+
+    assert!(
+        !arguments.is_empty(),
+        "the arguments line must still be emitted at DEBUG; the events were {:?}",
+        recorded.event_summary()
+    );
+
+    for (owner, value) in arguments {
+        assert_no_deception(owner, "arguments", value);
+        assert!(
+            value.len() <= 1100,
+            "the arguments field is unbounded at {} bytes; a caller sets it and with `otel` \
+             on it leaves the process",
+            value.len()
+        );
     }
 }
 

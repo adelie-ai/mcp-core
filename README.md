@@ -97,9 +97,11 @@ the request id and the transport. The message inside the `CallError` goes to
 DEBUG instead, because a server writing `failed to read {path}` puts a caller's
 argument in it, and that value has an audience of one until something logs it.
 
-Values a caller chose are also capped and stripped before they reach a field. A
-newline in a tool name would otherwise produce what reads as a second genuine
-log line, and an ANSI escape would survive into whatever is reading the log.
+Every value a caller reaches is capped and stripped before it reaches a field,
+the arguments payload included. Left alone, a newline in a tool name produces
+what reads as a second genuine log line, an ANSI escape survives into whatever
+is reading the log, a line separator breaks a record for a JSON consumer, and a
+bidi control reverses what a person sees while the bytes stay honest.
 
 ### What the dispatch path emits
 
