@@ -576,6 +576,153 @@ fn tool_error_result(message: &str) -> Value {
     })
 }
 
+/// The shared sanitiser must agree with this crate's own, character for
+/// character, before this crate stops using its own.
+///
+/// Thirteen servers inherit whatever this crate decides here, so the swap has
+/// to be proved rather than argued. Each test drives the same input through
+/// both and compares the rendered output. A disagreement is a defect in one of
+/// them, not something to reconcile at the call site.
+#[cfg(test)]
+mod shared_safe_agreement {
+    use super::{Safe, SafeJson};
+    use adelie_telemetry::Safe as Shared;
+    use serde_json::json;
+
+    /// Every character this crate replaces, and why.
+    ///
+    /// Category Cc is C0, DEL and C1. Categories Zl and Zp are U+2028 and
+    /// U+2029. The rest are the bidi controls: the marks, the embeddings, the
+    /// overrides, the isolates and the two pops.
+    fn deceptive_characters() -> Vec<char> {
+        let mut set: Vec<char> = Vec::new();
+        set.extend((0x00..=0x1f).filter_map(char::from_u32));
+        set.push('\u{7f}');
+        set.extend((0x80..=0x9f).filter_map(char::from_u32));
+        set.push('\u{2028}');
+        set.push('\u{2029}');
+        set.extend(['\u{061c}', '\u{200e}', '\u{200f}']);
+        set.extend((0x202a..=0x202e).filter_map(char::from_u32));
+        set.extend((0x2066..=0x2069).filter_map(char::from_u32));
+        set
+    }
+
+    #[test]
+    fn the_two_agree_on_every_deceptive_character() {
+        for character in deceptive_characters() {
+            let input = format!("a{character}b");
+            assert_eq!(
+                Safe::name(&input).to_string(),
+                Shared::name(&input).to_string(),
+                "the two disagree on U+{:04X} in a name",
+                character as u32
+            );
+            assert_eq!(
+                Safe::message(&input).to_string(),
+                Shared::message(&input).to_string(),
+                "the two disagree on U+{:04X} in a message",
+                character as u32
+            );
+        }
+    }
+
+    /// The deceptive set is only half the question. A character this crate
+    /// keeps must also be kept by the shared one, or the swap silently damages
+    /// every value the fleet logs.
+    #[test]
+    fn the_two_agree_on_every_character_below_the_astral_planes() {
+        for code_point in 0x00..=0xffff {
+            let Some(character) = char::from_u32(code_point) else {
+                continue;
+            };
+            let input = format!("a{character}b");
+            assert_eq!(
+                Safe::name(&input).to_string(),
+                Shared::name(&input).to_string(),
+                "the two disagree on U+{code_point:04X}"
+            );
+        }
+    }
+
+    /// A four-byte character is where a byte cap and a character cap diverge.
+    #[test]
+    fn the_two_agree_on_the_astral_planes() {
+        for code_point in [0x1f600, 0x1f468, 0x1f469, 0x10ffff, 0x10000] {
+            let character = char::from_u32(code_point).expect("a valid scalar value");
+            let input = format!("a{character}b");
+            assert_eq!(
+                Safe::name(&input).to_string(),
+                Shared::name(&input).to_string(),
+                "the two disagree on U+{code_point:04X}"
+            );
+        }
+    }
+
+    /// Both caps, on both sides of the boundary, including the two ways a cap
+    /// can be overrun: a replacement that is wider than what it replaced, and
+    /// a multi-byte character that straddles the limit.
+    #[test]
+    fn the_two_agree_on_every_cap_boundary() {
+        let mut cases: Vec<String> = Vec::new();
+        for length in [0, 1, 127, 128, 129, 1023, 1024, 1025, 4096] {
+            cases.push("x".repeat(length));
+            cases.push("\n".repeat(length));
+            cases.push(format!("{}\u{1f600}", "x".repeat(length)));
+            cases.push(format!("{}\u{202e}x", "x".repeat(length)));
+        }
+
+        for input in cases {
+            assert_eq!(
+                Safe::name(&input).to_string(),
+                Shared::name(&input).to_string(),
+                "the two disagree on a {}-byte name",
+                input.len()
+            );
+            assert_eq!(
+                Safe::message(&input).to_string(),
+                Shared::message(&input).to_string(),
+                "the two disagree on a {}-byte message",
+                input.len()
+            );
+        }
+    }
+
+    /// The JSON wrapper renders the value to a string and caps that. The
+    /// shared one takes the value itself and caps the stream its `Display`
+    /// writes in pieces. The two must produce the same field.
+    #[test]
+    fn the_two_agree_on_a_json_value() {
+        let cases = [
+            json!({ "path": format!("/tmp/a{}b", '\u{202e}') }),
+            json!({ "note": format!("x{}y", '\u{2028}'), "n": 1 }),
+            json!({ "bulk": "b".repeat(64 * 1024) }),
+            json!([1, "two", null, true]),
+            json!(null),
+            json!({}),
+        ];
+
+        for value in cases {
+            assert_eq!(
+                SafeJson(&value).to_string(),
+                Shared::message(&value).to_string(),
+                "the two disagree on the JSON value {value}"
+            );
+        }
+    }
+
+    /// The two caps must be the same numbers, not merely the same shape.
+    #[test]
+    fn the_two_agree_on_the_cap_sizes() {
+        assert_eq!(super::MAX_NAME_BYTES, adelie_telemetry::MAX_NAME_BYTES);
+        assert_eq!(
+            super::MAX_MESSAGE_BYTES,
+            adelie_telemetry::MAX_MESSAGE_BYTES
+        );
+        assert_eq!(super::REPLACEMENT, adelie_telemetry::REPLACEMENT);
+        assert_eq!(super::TRUNCATED, adelie_telemetry::TRUNCATED);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

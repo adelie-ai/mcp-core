@@ -36,7 +36,7 @@ reqwest = { version = "0.13", features = ["json"], optional = true }
 # records through, and the trace-context helpers. Not optional — a default
 # build of it resolves no opentelemetry crate, so a stdio-only server pays
 # nothing for it. The `otel` feature below is what turns export on.
-adelie-telemetry = { git = "https://github.com/adelie-ai/adelie-telemetry", rev = "1b8166ab483174e76aa23079858b8a31aaa52ae1" }
+adelie-telemetry = { git = "https://github.com/adelie-ai/adelie-telemetry", rev = "5c762eca14e43295dd27c5d5adaa658924f5f133" }
 # Spans and events on the dispatch path. Already in the tree through
 # adelie-telemetry, so naming it directly adds no crate.
 tracing = "0.1.44"
