@@ -19,6 +19,8 @@ revision or a protocol fix costs one pin bump instead of thirteen rewrites.
   flags.
 - **Telemetry.** The process subscriber, installed by `run`, and the spans and
   metrics over the dispatch path.
+- **Process lifecycle.** The stop signals `run` listens for, so a server that
+  Kubernetes or a terminal stops flushes its telemetry before it exits.
 
 ### What it refuses
 
@@ -26,8 +28,9 @@ revision or a protocol fix costs one pin bump instead of thirteen rewrites.
   its own tools, its own schemas and its own configuration.
 - Deciding a tool's schema dialect. Schemas reach the wire verbatim; the
   crate never injects, strips or rewrites a key.
-- Installing a subscriber anywhere except `run`. A server library hosted
-  inside another binary inherits that binary's subscriber.
+- Installing a subscriber or a signal handler anywhere except `run`. A server
+  library hosted inside another binary inherits that binary's subscriber and
+  that binary's signal handling.
 
 ## Use
 
@@ -213,20 +216,70 @@ written at ERROR.
 
 ### When the exporters flush
 
-The OTLP exporters buffer, and they flush when `run` returns.
+The OTLP exporters buffer, and they flush when `run` returns. `run` returns for
+two reasons, and both flush.
 
-Over **stdio** that happens on its own: the client closes the stream, `run`
-returns, and the buffer goes out.
+The **client ends the session**. Over stdio it closes the stream, over unix and
+websocket it closes the connection. The buffer goes out, and the process exits
+with whatever `run` returned.
 
-Over **unix** and **websocket** the server has no exit of its own. The accept
-loop runs until something kills the process, and a process killed by `SIGTERM`
-or `SIGINT` runs no destructor, so whatever the exporters still held is lost.
-Nothing here catches either signal today.
+The **process is asked to stop**, with `SIGTERM` or `SIGINT`. `run` ends the
+serve loop, flushes, and exits 0. This works over all three transports, and it
+is what makes a rolling deployment keep the window it was in: Kubernetes stops
+every pod with `SIGTERM`.
 
 Console output and the periodic metrics summary are unaffected either way,
-because both are written as they happen rather than buffered. An operator who
-needs the exported copy of the last few seconds should read the console log for
-that window instead.
+because both are written as they happen rather than buffered.
+
+## Stopping a server
+
+`run` listens for `SIGTERM` and `SIGINT`, and treats them identically.
+`SIGTERM` is what Kubernetes, systemd and `kill` send. `SIGINT` is what a
+terminal sends on Ctrl-C.
+
+`SIGHUP` is deliberately not handled. There is no reload for it to mean, because
+a server's configuration is fixed by its command line. And a handler would
+replace an inherited `SIG_IGN`, so a server started under `nohup` would start
+dying with its terminal instead of surviving it.
+
+| Question | Answer |
+|---|---|
+| In-flight requests | Cut, not drained. The process is going away inside the grace period, and a client already handles a transport that closes under it. |
+| `McpService::shutdown` | Not called. It is a de-initialize hook driven by a client `shutdown` request, after which the session keeps serving. |
+| Exit status | `0`. Kubernetes reports the container as Completed, and systemd counts exit 0 as success. |
+| `SIGINT` | The same as `SIGTERM`, in every respect. |
+| Where the handler lives | `run`, and nowhere else. `serve` is a plain library call and installs nothing. |
+
+Stopping adds no wait of its own. The flush is bounded by the telemetry guard's
+shutdown budget, five seconds by default, well inside the 30-second Kubernetes
+default grace period. A second signal that arrives during the flush is absorbed:
+it neither shortens the budget nor ends the process early, so a second Ctrl-C
+looks ignored for as long as the flush takes.
+
+`run` ends the process itself once the flush is done, rather than returning to
+`main`. `tokio::io::stdin` reads on a blocking task, and dropping that read does
+not end it, so the runtime's own shutdown would wait for a stdin read that the
+peer is still holding open. A stdio server would flush and then hang. `run` is
+the process entry point by contract and already ends the process on `--help`,
+`--version` and a bad argument, where clap exits inside `get_matches`.
+
+A server that owns its own `main` and calls `serve` gets none of this, by
+design, and wires it itself. Both steps after the select matter: the flush has
+to happen there because the exit runs no destructor, and the exit has to happen
+at all because a returning stdio server hangs.
+
+```rust
+let telemetry = telemetry::init(telemetry::Config::new("example-mcp"))?;
+let mut stop = mcp_core::shutdown::StopSignals::install()?;
+
+let signal = tokio::select! {
+    result = mcp_core::serve(core, &args) => return result,
+    signal = stop.recv() => signal,
+};
+tracing::info!(%signal, "stopping");
+drop(telemetry);
+std::process::exit(0);
+```
 
 Which transport to choose, what each one trusts for TLS, and what a container
 image needs are covered by

@@ -7,22 +7,31 @@
 //! most, because the seconds before a restart are usually what is being
 //! investigated, and Kubernetes stops every pod this way.
 //!
-//! [`crate::run`] therefore listens for the stop signals and returns instead of
-//! being killed, which drops the guard on the normal path. A server that owns
-//! its own `main` and calls [`crate::serve`] directly does the same with
+//! [`crate::run`] therefore listens for the stop signals, flushes the guard, and
+//! ends the process on the normal path instead of being killed. A server that
+//! owns its own `main` and calls [`crate::serve`] directly does the same with
 //! [`StopSignals`]:
 //!
 //! ```no_run
 //! # async fn example(core: std::sync::Arc<mcp_core::ServerCore>) -> mcp_core::Result<()> {
 //! # let args = mcp_core::CommonServeArgs::default();
+//! use mcp_core::telemetry;
+//!
+//! let telemetry = telemetry::init(telemetry::Config::new("example-mcp"))?;
 //! let mut stop = mcp_core::shutdown::StopSignals::install()?;
-//! tokio::select! {
-//!     result = mcp_core::serve(core, &args) => result,
-//!     signal = stop.recv() => {
-//!         tracing::info!(%signal, "stopping");
-//!         Ok(())
-//!     }
-//! }
+//!
+//! let signal = tokio::select! {
+//!     // The client ended the session. The guard drops as this returns.
+//!     result = mcp_core::serve(core, &args) => return result,
+//!     signal = stop.recv() => signal,
+//! };
+//! tracing::info!(%signal, "stopping");
+//!
+//! // In this order, and both steps matter. The flush has to happen here,
+//! // because the exit runs no destructor. The exit has to happen at all,
+//! // because a returning stdio server hangs; see "What stopping costs".
+//! drop(telemetry);
+//! std::process::exit(0);
 //! # }
 //! ```
 //!
@@ -49,6 +58,14 @@
 //!
 //! The process exits 0 rather than dying by the signal. Kubernetes reports the
 //! container as Completed, and systemd counts exit 0 as success.
+//!
+//! [`crate::run`] ends the process itself once the flush is done, rather than
+//! returning to `main`. `tokio::io::stdin` reads on a blocking task, and
+//! dropping that read does not end it, so the runtime's own shutdown would wait
+//! for a stdin read that the peer is still holding open, and a stdio server
+//! would flush and then hang. A server that calls [`crate::serve`] and uses
+//! [`StopSignals`] directly keeps control of its own exit, and takes on that
+//! question with it.
 //!
 //! # How long it takes
 //!
