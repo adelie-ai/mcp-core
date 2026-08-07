@@ -440,8 +440,18 @@ impl Session {
                     tracing::debug!(reason = %Safe::message(&msg), "tool returned an error result");
                     Outcome::Result(tool_error_result(&msg))
                 }
+                // A fault, so the line stays at ERROR: an operator has to see
+                // that a tool broke without raising the level first. The
+                // message does not stay with it. `CallError::internal` is as
+                // free-form as the other two variants, and the idiom a server
+                // reaches for on an unexpected IO fault quotes an argument back
+                // (`failed to read {path}`), which D10 keeps off the INFO band.
+                // The span around this line carries the tool, the method, the
+                // request id and the transport, so the ERROR is still
+                // actionable and still correlated without it.
                 Err(CallError::Internal(msg)) => {
-                    tracing::error!(error = %Safe::message(&msg), "tool call failed");
+                    tracing::error!("tool call failed");
+                    tracing::debug!(error = %Safe::message(&msg), "tool call failure detail");
                     Outcome::Error(code::INTERNAL_ERROR, msg)
                 }
             }

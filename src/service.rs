@@ -244,6 +244,11 @@ impl CallError {
         CallError::InvalidParams(message.into())
     }
     /// Internal error (becomes JSON-RPC `-32603`).
+    ///
+    /// Say what broke, and name the cause. The dispatcher reports the fault at
+    /// ERROR and keeps this message for DEBUG, because the idiom here quotes a
+    /// caller's own argument back (`failed to read {path}`) and an argument
+    /// does not belong on the INFO band.
     pub fn internal(message: impl Into<String>) -> Self {
         CallError::Internal(message.into())
     }

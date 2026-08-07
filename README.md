@@ -85,11 +85,21 @@ This contract is a rule, not a preference.
 | Level | Carries |
 |---|---|
 | INFO | ids, counts, durations, method names, tool names. **Never content.** |
-| DEBUG | tool arguments, and the reason a tool declined. |
+| DEBUG | tool arguments, the reason a tool declined, and the detail of a failure. |
 
 Tool arguments carry file paths, command lines and search text, so they never
 reach a span field or an INFO line. `RUST_LOG=debug` is what it takes to see
 them, and with a collector configured that means they leave the process.
+
+A failed tool call writes `tool call failed` at ERROR, so an operator sees the
+fault at the default level, and the surrounding span names the tool, the method,
+the request id and the transport. The message inside the `CallError` goes to
+DEBUG instead, because a server writing `failed to read {path}` puts a caller's
+argument in it, and that value has an audience of one until something logs it.
+
+Values a caller chose are also capped and stripped before they reach a field. A
+newline in a tool name would otherwise produce what reads as a second genuine
+log line, and an ANSI escape would survive into whatever is reading the log.
 
 ### What the dispatch path emits
 
@@ -182,6 +192,23 @@ nothing is a default build, not an `otel` build with the variables left unset.
 A collector that cannot be reached costs the process its export and nothing
 else. Console logging and the metrics summary continue, and the reason is
 written at ERROR.
+
+### When the exporters flush
+
+The OTLP exporters buffer, and they flush when `run` returns.
+
+Over **stdio** that happens on its own: the client closes the stream, `run`
+returns, and the buffer goes out.
+
+Over **unix** and **websocket** the server has no exit of its own. The accept
+loop runs until something kills the process, and a process killed by `SIGTERM`
+or `SIGINT` runs no destructor, so whatever the exporters still held is lost.
+Nothing here catches either signal today.
+
+Console output and the periodic metrics summary are unaffected either way,
+because both are written as they happen rather than buffered. An operator who
+needs the exported copy of the last few seconds should read the console log for
+that window instead.
 
 Which transport to choose, what each one trusts for TLS, and what a container
 image needs are covered by

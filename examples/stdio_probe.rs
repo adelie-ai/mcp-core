@@ -15,22 +15,27 @@ struct Probe;
 #[mcp_core::async_trait]
 impl McpService for Probe {
     fn tools(&self) -> Vec<ToolDef> {
-        vec![ToolDef::new(
-            "echo",
-            "return the text it was given",
-            json!({
-                "type": "object",
-                "properties": { "text": { "type": "string" } },
-                "required": ["text"],
-            }),
-        )]
+        let schema = json!({
+            "type": "object",
+            "properties": { "text": { "type": "string" } },
+            "required": ["text"],
+        });
+        vec![
+            ToolDef::new("echo", "return the text it was given", schema.clone()),
+            ToolDef::new("fail", "report an internal server fault", schema),
+        ]
     }
 
     async fn call_tool(&self, name: &str, args: &Value) -> Result<ToolReply, CallError> {
+        let text = args.get("text").and_then(Value::as_str).unwrap_or_default();
         match name {
-            "echo" => Ok(ToolReply::text(
-                args.get("text").and_then(Value::as_str).unwrap_or_default(),
-            )),
+            "echo" => Ok(ToolReply::text(text)),
+            // The idiom a real server reaches for on an unexpected IO fault.
+            // It quotes an argument back, which is what makes the level the
+            // dispatcher reports it at worth proving.
+            "fail" => Err(CallError::internal(format!(
+                "failed to read {text}: permission denied"
+            ))),
             other => Err(CallError::tool(format!("unknown tool: {other}"))),
         }
     }

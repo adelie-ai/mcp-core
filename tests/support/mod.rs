@@ -114,7 +114,13 @@ impl McpService for Demo {
     async fn call_tool(&self, name: &str, args: &Value) -> Result<ToolReply, CallError> {
         match name {
             "echo" | "metrics_probe" => Ok(ToolReply::text(args.to_string())),
-            "boom" => Err(CallError::internal("the demo tool was told to fail")),
+            // The idiom a real server reaches for on an unexpected IO fault,
+            // and the reason an internal error is not safe to print whole: the
+            // message quotes an argument back.
+            "boom" => Err(CallError::internal(format!(
+                "failed to read {}: permission denied",
+                args.get("path").and_then(Value::as_str).unwrap_or_default()
+            ))),
             "bad" => Err(CallError::invalid_params(
                 "the demo tool wanted other arguments",
             )),

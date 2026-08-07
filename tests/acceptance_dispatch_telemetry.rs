@@ -78,6 +78,14 @@ fn stdio_stdout_carries_only_jsonrpc() {
             "method": "tools/call",
             "params": {"name": "echo", "arguments": {"text": SECRET_ARGUMENT}},
         }),
+        // The error path writes a different response shape, and it is the one
+        // that also drives a log line, so it has to stay clean too.
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {"name": "fail", "arguments": {"text": SECRET_ARGUMENT}},
+        }),
     ];
 
     let mut child = Command::new(&probe)
@@ -119,7 +127,7 @@ fn stdio_stdout_carries_only_jsonrpc() {
         );
         replies += 1;
     }
-    assert_eq!(replies, 3, "the probe must answer all three requests");
+    assert_eq!(replies, 4, "the probe must answer all four requests");
 
     assert!(
         stderr.contains("INFO") || stderr.contains("TRACE") || stderr.contains("DEBUG"),
@@ -209,6 +217,62 @@ fn tools_call_span_does_not_record_arguments() {
         at_debug,
         "tool arguments must be available at DEBUG, or the level contract has nothing to \
          hold back; the events were {:?}",
+        recorded.event_summary()
+    );
+}
+
+/// An internal tool fault is loud, but its message stays off the INFO band.
+///
+/// `CallError::internal` is as free-form as the other two variants, and the
+/// idiom a server reaches for on an unexpected IO fault quotes an argument back
+/// (`failed to read {path}`). Printing it whole at ERROR would hand an
+/// operations audience, and an OTLP backend, a value that only the caller had
+/// before. The fault itself still has to be visible at the default level, so
+/// the line stays and only the free-form part moves down.
+#[test]
+fn internal_tool_failure_keeps_its_message_off_the_error_line() {
+    let recorded = capture_dispatch(&[
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": "boom", "arguments": {"path": SECRET_ARGUMENT}},
+        }),
+    ]);
+
+    for event in &recorded.events {
+        if event.level > Level::INFO {
+            continue;
+        }
+        for (key, value) in &event.fields {
+            assert!(
+                !value.contains("MARKER-9d3f"),
+                "an internal error message carried an argument to a {} line, field {key:?}: \
+                 {value:?}",
+                event.level
+            );
+        }
+    }
+
+    assert!(
+        recorded
+            .events
+            .iter()
+            .any(|event| event.level == Level::ERROR),
+        "a server fault must still be visible at the default level; the events were {:?}",
+        recorded.event_summary()
+    );
+
+    assert!(
+        recorded.events.iter().any(|event| {
+            event.level == Level::DEBUG
+                && event
+                    .fields
+                    .values()
+                    .any(|value| value.contains("MARKER-9d3f"))
+        }),
+        "the failure detail must still be reachable at DEBUG; the events were {:?}",
         recorded.event_summary()
     );
 }
