@@ -20,7 +20,7 @@
 //!   wiring any of it. Nothing else in this crate installs one: a server
 //!   library hosted inside another binary must not fight that binary's own
 //!   subscriber.
-//! - **Process lifecycle** — [`run`] also stops on `SIGTERM` or `SIGINT` and
+//! - **Process lifecycle** - [`run`] also stops on `SIGTERM` or `SIGINT` and
 //!   flushes that subscriber on the way out, so a server that Kubernetes or a
 //!   terminal stops still reports the window it was in. Like the subscriber,
 //!   this belongs to [`run`] alone; see [`shutdown`].

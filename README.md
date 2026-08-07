@@ -210,9 +210,16 @@ An `otel` build always builds the three pipelines. With no endpoint set they
 take the OTLP default of `http://localhost:4318`, so the build that exports
 nothing is a default build, not an `otel` build with the variables left unset.
 
-A collector that cannot be reached costs the process its export and nothing
-else. Console logging and the metrics summary continue, and the reason is
-written at ERROR.
+A collector that cannot be reached costs the process its export, and while it is
+running it costs nothing else. Console logging and the metrics summary continue,
+and the reason is written at ERROR.
+
+It costs one thing at the end. A stop waits for the flush to give up, which is
+the telemetry guard's shutdown budget, five seconds by default. Measured against
+a collector whose packets are dropped rather than refused: the process wrote its
+metrics summary at once, warned that the pipelines had not shut down inside the
+budget, and exited 0 after 5.1 seconds. A refused connection fails immediately
+and costs nothing at all.
 
 ### When the exporters flush
 
