@@ -45,10 +45,7 @@
 //! from here rather than writing its own: a second copy drifts, and the caps
 //! then differ between two binaries reading the same value.
 //!
-//! The caps and the two markers come with it - [`MAX_NAME_BYTES`],
-//! [`MAX_MESSAGE_BYTES`], [`REPLACEMENT`] and [`TRUNCATED`] - so a server that
-//! asserts what a field costs names the constant instead of writing the number
-//! again.
+//! [`Safe::name`] caps at 128 bytes and [`Safe::message`] at 1024.
 //!
 //! # Installing the subscriber
 //!
@@ -70,7 +67,4 @@
 //!
 //! Everything else comes from the standard `OTEL_*` environment variables.
 
-pub use adelie_telemetry::{
-    Config, Error, Guard, MAX_MESSAGE_BYTES, MAX_NAME_BYTES, REPLACEMENT, Safe, TRUNCATED, init,
-    metrics, trace_context,
-};
+pub use adelie_telemetry::{Config, Error, Guard, Safe, init, metrics, trace_context};
