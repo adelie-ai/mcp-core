@@ -394,9 +394,9 @@ where
         .map_err(|e| Error::Config(format!("argument parsing: {e}")))?;
 
     // After argument parsing, so `--help` and `--version` install nothing, and
-    // before the service is built, so a failure there is reported. The guard
-    // lives for the rest of `run`; dropping it flushes the exporters, and a
-    // process that exits without that loses whatever they had buffered.
+    // before the service is built, so a failure there is reported. Dropping the
+    // guard is what flushes the exporters, and a process that exits without that
+    // loses whatever they had buffered, so both ways out of `run` below drop it.
     let telemetry = crate::telemetry::init(crate::telemetry::Config::new(config.name.clone()))?;
 
     // Before the service is built, so a signal that arrives while `build` is
