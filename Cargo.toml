@@ -3,7 +3,7 @@ name = "mcp-core"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "Shared core for the adelie-ai hand-rolled MCP servers: JSON-RPC 2.0 protocol/dispatch, stdio/websocket/unix transports, and a standard Clap CLI with a per-server extension hook."
+description = "Shared core for the adelie-ai hand-rolled MCP servers: JSON-RPC 2.0 protocol/dispatch, stdio/websocket/unix transports, a standard Clap CLI with a per-server extension hook, and the process telemetry subscriber that its runner installs."
 repository = "https://github.com/adelie-ai/mcp-core"
 
 [dependencies]

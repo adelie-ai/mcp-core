@@ -14,6 +14,12 @@
 //! - **CLI** — a standard Clap `serve` setup ([`CommonServeArgs`]); a server
 //!   adds its own flags and hands mcp-core a [`ServerConfig`] plus an
 //!   [`McpService`] implementation.
+//! - **Telemetry** — [`run`] installs the process-wide subscriber from
+//!   `adelie-telemetry`, so every server that uses the standard entry point
+//!   gets stderr logging, spans over its JSON-RPC dispatch and metrics without
+//!   wiring any of it. Nothing else in this crate installs one: a server
+//!   library hosted inside another binary must not fight that binary's own
+//!   subscriber.
 //!
 //! ## Minimal server
 //!
