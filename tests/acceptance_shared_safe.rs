@@ -5,6 +5,10 @@
 //! to. The set of characters below is that contract written as data: if the
 //! shared predicate is ever narrowed, one of these tests fails and names the
 //! character that stopped being replaced.
+//!
+//! The caps and the markers are written out here rather than read from the
+//! crate. Reading them would compare a constant to itself and pass whatever
+//! the numbers became.
 
 use mcp_core::telemetry::Safe;
 

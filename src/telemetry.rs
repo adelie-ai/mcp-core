@@ -23,6 +23,33 @@
 //! cardinality cap can bound it. A label value is a name, never content: a
 //! tool argument used as a label is both a data leak and a memory leak.
 //!
+//! # Putting a caller's value on a log line
+//!
+//! [`Safe`] is the one way to do it. A tool name, a search term or an error
+//! message that quotes the input back can end the log line and start one that
+//! reads as genuine, drive the terminal with an escape, or reverse what a
+//! reader sees with a bidi control. None of them is bounded in length either,
+//! and with `otel` on a span field leaves the process verbatim.
+//!
+//! ```
+//! use mcp_core::telemetry::Safe;
+//!
+//! # let tool_name = "search";
+//! # let detail = "not found";
+//! tracing::info!(tool = %Safe::name(tool_name), "tool call finished");
+//! tracing::debug!(reason = %Safe::message(detail), "tool returned an error");
+//! ```
+//!
+//! It wraps anything that can be displayed, so a JSON value or an error goes
+//! through it without being rendered to a `String` first. A server reaches it
+//! from here rather than writing its own: a second copy drifts, and the caps
+//! then differ between two binaries reading the same value.
+//!
+//! The caps and the two markers come with it - [`MAX_NAME_BYTES`],
+//! [`MAX_MESSAGE_BYTES`], [`REPLACEMENT`] and [`TRUNCATED`] - so a server that
+//! asserts what a field costs names the constant instead of writing the number
+//! again.
+//!
 //! # Installing the subscriber
 //!
 //! [`crate::run`] already calls [`init`] with the server's own name, so a
@@ -43,4 +70,7 @@
 //!
 //! Everything else comes from the standard `OTEL_*` environment variables.
 
-pub use adelie_telemetry::{Config, Error, Guard, init, metrics, trace_context};
+pub use adelie_telemetry::{
+    Config, Error, Guard, MAX_MESSAGE_BYTES, MAX_NAME_BYTES, REPLACEMENT, Safe, TRUNCATED, init,
+    metrics, trace_context,
+};

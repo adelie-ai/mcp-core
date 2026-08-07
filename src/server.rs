@@ -9,6 +9,7 @@ use tracing::Instrument;
 use crate::config::{ServerConfig, TransportKind};
 use crate::error::code;
 use crate::service::{CallError, McpService};
+use crate::telemetry::Safe;
 use crate::telemetry::metrics::{self, Label};
 
 /// The `method` label used for a payload that never named a method: a batch
@@ -27,144 +28,17 @@ const METHOD_OTHER: &str = "other";
 /// The `request_id` span field used for a notification, which has no id.
 const NO_REQUEST_ID: &str = "-";
 
-/// The most bytes of a caller-chosen name a log field keeps.
-///
-/// The same limit the metrics facade puts on a label value, so one name reads
-/// the same way whichever signal an operator looks at.
-const MAX_NAME_BYTES: usize = 128;
-
-/// The most bytes of a diagnostic message a log field keeps.
-///
-/// Wider than a name, because the text is mostly what this crate or the server
-/// wrote and is worth keeping whole.
-const MAX_MESSAGE_BYTES: usize = 1024;
-
-/// What replaces a character that could end a log line.
-const REPLACEMENT: char = '\u{fffd}';
-
-/// What marks a value the cap cut short.
-const TRUNCATED: &str = "...";
-
-/// A value a caller can influence, rendered safely into a log field.
-///
-/// Two things make a raw value unsafe here. The console layer writes a field
-/// value straight into a line, so a newline in one produces what reads as a
-/// second genuine line, with a real timestamp column, level and target; and an
-/// ANSI escape survives, because turning the formatter's own colour off does
-/// not strip an escape carried inside a value. Control characters are replaced
-/// rather than dropped, so the field still shows that something was there.
-///
-/// Length is the second problem. Nothing bounds a method name, a tool name or
-/// a request id short of the transport's frame cap, which is measured in
-/// megabytes, and with the `otel` feature on a span field leaves the process
-/// verbatim. One request could otherwise ship as much as it liked.
-///
-/// This wraps what a *caller* reaches. It does not wrap the socket path or the
-/// listen address, which come from the operator's own command line and are
-/// written once at startup.
-pub(crate) struct Safe<'a> {
-    value: &'a str,
-    cap: usize,
-}
-
-impl<'a> Safe<'a> {
-    /// A name the caller chose: a method, a tool, a request id. Short by
-    /// nature, so the tight cap costs nothing real.
-    pub(crate) fn name(value: &'a str) -> Self {
-        Self {
-            value,
-            cap: MAX_NAME_BYTES,
-        }
-    }
-
-    /// A diagnostic message. Mostly text this crate or the server wrote, but a
-    /// server routinely quotes the caller's own input back inside it.
-    pub(crate) fn message(value: &'a str) -> Self {
-        Self {
-            value,
-            cap: MAX_MESSAGE_BYTES,
-        }
-    }
-}
-
-impl std::fmt::Display for Safe<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        use std::fmt::Write;
-
-        let mut written = 0;
-        for character in self.value.chars() {
-            let safe = if is_deceptive(character) {
-                REPLACEMENT
-            } else {
-                character
-            };
-            let length = safe.len_utf8();
-            if written + length > self.cap {
-                return f.write_str(TRUNCATED);
-            }
-            f.write_char(safe)?;
-            written += length;
-        }
-        Ok(())
-    }
-}
-
-/// Whether this character could make a field render as something other than
-/// what it is.
-///
-/// Three kinds, and each defeats a different reader.
-///
-/// - `char::is_control` covers C0, C1 and DEL. Those end a line or drive a
-///   terminal.
-/// - U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR are categories Zl
-///   and Zp. `is_control` does not cover them, and some log viewers, and every
-///   JSON consumer, treat them as a line break.
-/// - The bidi controls leave the bytes alone and reverse what a person sees,
-///   so a name renders as something it is not. This is the trojan-source
-///   class, and the set is the one rustc's own
-///   `text_direction_codepoint_in_literal` lint covers.
-///
-/// The wider Cf category is deliberately not swept. A zero-width joiner is Cf
-/// and carries the emoji sequences a person does want to read, and hiding text
-/// is a weaker problem than reversing it.
-fn is_deceptive(character: char) -> bool {
-    character.is_control()
-        || matches!(
-            character,
-            '\u{2028}'
-                | '\u{2029}'
-                | '\u{061c}'
-                | '\u{200e}'
-                | '\u{200f}'
-                | '\u{202a}'..='\u{202e}'
-                | '\u{2066}'..='\u{2069}'
-        )
-}
-
-/// A JSON value as a log field, rendered only if a subscriber asks for it.
-///
-/// A JSON rendering escapes the C0 controls on its own, which is what made
-/// this path look safe. It does not escape U+2028, U+2029 or a bidi control,
-/// and it bounds nothing, so it goes through [`Safe`] like any other value a
-/// caller reaches.
-struct SafeJson<'a>(&'a Value);
-
-impl std::fmt::Display for SafeJson<'_> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", Safe::message(&self.0.to_string()))
-    }
-}
-
 /// A JSON-RPC id as a span field, rendered only if a subscriber asks for it.
 struct RequestId<'a>(Option<&'a Value>);
 
 impl std::fmt::Display for RequestId<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.0 {
-            // A JSON rendering escapes a control character on its own. The cap
-            // is what [`Safe`] adds here, because a caller sets the id and
-            // nothing else bounds how long it is.
-            Some(id) => write!(f, "{}", Safe::name(&id.to_string())),
+            // A JSON rendering escapes a control character on its own, but it
+            // escapes neither U+2028 and U+2029 nor a bidi control, and it
+            // bounds nothing. A caller sets the id, so it goes through
+            // [`Safe`] like any other value a caller reaches.
+            Some(id) => write!(f, "{}", Safe::name(id)),
             None => f.write_str(NO_REQUEST_ID),
         }
     }
@@ -428,7 +302,13 @@ impl Session {
         // D10 keeps them off both, and puts them on a DEBUG line instead.
         let span = tracing::info_span!("mcp.tools.call", tool = %Safe::name(name));
         async move {
-            tracing::debug!(arguments = %SafeJson(&arguments), "tool call arguments");
+            // A JSON rendering escapes the C0 controls on its own, which is
+            // what made this path look safe. It escapes neither U+2028 and
+            // U+2029 nor a bidi control, and it bounds nothing, so the value
+            // goes through the same wrapper as every other one a caller
+            // reaches. The wrapper takes the value itself, so nothing is
+            // rendered unless a subscriber asks for the field.
+            tracing::debug!(arguments = %Safe::message(&arguments), "tool call arguments");
             let started = Instant::now();
             let result = self.core.service.call_tool(name, &arguments).await;
             let outcome = match &result {
@@ -574,153 +454,6 @@ fn tool_error_result(message: &str) -> Value {
         "isError": true,
         "content": [{ "type": "text", "text": message }],
     })
-}
-
-/// The shared sanitiser must agree with this crate's own, character for
-/// character, before this crate stops using its own.
-///
-/// Thirteen servers inherit whatever this crate decides here, so the swap has
-/// to be proved rather than argued. Each test drives the same input through
-/// both and compares the rendered output. A disagreement is a defect in one of
-/// them, not something to reconcile at the call site.
-#[cfg(test)]
-mod shared_safe_agreement {
-    use super::{Safe, SafeJson};
-    use adelie_telemetry::Safe as Shared;
-    use serde_json::json;
-
-    /// Every character this crate replaces, and why.
-    ///
-    /// Category Cc is C0, DEL and C1. Categories Zl and Zp are U+2028 and
-    /// U+2029. The rest are the bidi controls: the marks, the embeddings, the
-    /// overrides, the isolates and the two pops.
-    fn deceptive_characters() -> Vec<char> {
-        let mut set: Vec<char> = Vec::new();
-        set.extend((0x00..=0x1f).filter_map(char::from_u32));
-        set.push('\u{7f}');
-        set.extend((0x80..=0x9f).filter_map(char::from_u32));
-        set.push('\u{2028}');
-        set.push('\u{2029}');
-        set.extend(['\u{061c}', '\u{200e}', '\u{200f}']);
-        set.extend((0x202a..=0x202e).filter_map(char::from_u32));
-        set.extend((0x2066..=0x2069).filter_map(char::from_u32));
-        set
-    }
-
-    #[test]
-    fn the_two_agree_on_every_deceptive_character() {
-        for character in deceptive_characters() {
-            let input = format!("a{character}b");
-            assert_eq!(
-                Safe::name(&input).to_string(),
-                Shared::name(&input).to_string(),
-                "the two disagree on U+{:04X} in a name",
-                character as u32
-            );
-            assert_eq!(
-                Safe::message(&input).to_string(),
-                Shared::message(&input).to_string(),
-                "the two disagree on U+{:04X} in a message",
-                character as u32
-            );
-        }
-    }
-
-    /// The deceptive set is only half the question. A character this crate
-    /// keeps must also be kept by the shared one, or the swap silently damages
-    /// every value the fleet logs.
-    #[test]
-    fn the_two_agree_on_every_character_below_the_astral_planes() {
-        for code_point in 0x00..=0xffff {
-            let Some(character) = char::from_u32(code_point) else {
-                continue;
-            };
-            let input = format!("a{character}b");
-            assert_eq!(
-                Safe::name(&input).to_string(),
-                Shared::name(&input).to_string(),
-                "the two disagree on U+{code_point:04X}"
-            );
-        }
-    }
-
-    /// A four-byte character is where a byte cap and a character cap diverge.
-    #[test]
-    fn the_two_agree_on_the_astral_planes() {
-        for code_point in [0x1f600, 0x1f468, 0x1f469, 0x10ffff, 0x10000] {
-            let character = char::from_u32(code_point).expect("a valid scalar value");
-            let input = format!("a{character}b");
-            assert_eq!(
-                Safe::name(&input).to_string(),
-                Shared::name(&input).to_string(),
-                "the two disagree on U+{code_point:04X}"
-            );
-        }
-    }
-
-    /// Both caps, on both sides of the boundary, including the two ways a cap
-    /// can be overrun: a replacement that is wider than what it replaced, and
-    /// a multi-byte character that straddles the limit.
-    #[test]
-    fn the_two_agree_on_every_cap_boundary() {
-        let mut cases: Vec<String> = Vec::new();
-        for length in [0, 1, 127, 128, 129, 1023, 1024, 1025, 4096] {
-            cases.push("x".repeat(length));
-            cases.push("\n".repeat(length));
-            cases.push(format!("{}\u{1f600}", "x".repeat(length)));
-            cases.push(format!("{}\u{202e}x", "x".repeat(length)));
-        }
-
-        for input in cases {
-            assert_eq!(
-                Safe::name(&input).to_string(),
-                Shared::name(&input).to_string(),
-                "the two disagree on a {}-byte name",
-                input.len()
-            );
-            assert_eq!(
-                Safe::message(&input).to_string(),
-                Shared::message(&input).to_string(),
-                "the two disagree on a {}-byte message",
-                input.len()
-            );
-        }
-    }
-
-    /// The JSON wrapper renders the value to a string and caps that. The
-    /// shared one takes the value itself and caps the stream its `Display`
-    /// writes in pieces. The two must produce the same field.
-    #[test]
-    fn the_two_agree_on_a_json_value() {
-        let cases = [
-            json!({ "path": format!("/tmp/a{}b", '\u{202e}') }),
-            json!({ "note": format!("x{}y", '\u{2028}'), "n": 1 }),
-            json!({ "bulk": "b".repeat(64 * 1024) }),
-            json!([1, "two", null, true]),
-            json!(null),
-            json!({}),
-        ];
-
-        for value in cases {
-            assert_eq!(
-                SafeJson(&value).to_string(),
-                Shared::message(&value).to_string(),
-                "the two disagree on the JSON value {value}"
-            );
-        }
-    }
-
-    /// The two caps must be the same numbers, not merely the same shape.
-    #[test]
-    fn the_two_agree_on_the_cap_sizes() {
-        assert_eq!(super::MAX_NAME_BYTES, adelie_telemetry::MAX_NAME_BYTES);
-        assert_eq!(
-            super::MAX_MESSAGE_BYTES,
-            adelie_telemetry::MAX_MESSAGE_BYTES
-        );
-        assert_eq!(super::REPLACEMENT, adelie_telemetry::REPLACEMENT);
-        assert_eq!(super::TRUNCATED, adelie_telemetry::TRUNCATED);
-    }
 }
 
 #[cfg(test)]
