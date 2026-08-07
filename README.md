@@ -103,6 +103,22 @@ what reads as a second genuine log line, an ANSI escape survives into whatever
 is reading the log, a line separator breaks a record for a JSON consumer, and a
 bidi control reverses what a person sees while the bytes stay honest.
 
+That covers what the dispatch path logs. A server that logs a caller's value
+itself reaches the same wrapper rather than writing one of its own, because a
+second copy drifts and the caps then differ between two binaries reading the
+same value:
+
+```rust
+use mcp_core::telemetry::Safe;
+
+tracing::info!(tool = %Safe::name(tool_name), "tool call finished");
+tracing::debug!(reason = %Safe::message(detail), "tool returned an error");
+```
+
+`Safe::name` caps at 128 bytes, `Safe::message` at 1024, and both replace what
+would deceive with U+FFFD. It wraps anything that can be displayed, so an error
+or a JSON value goes through it without being rendered to a string first.
+
 ### What the dispatch path emits
 
 One span per JSON-RPC request, and a child span per tool call:

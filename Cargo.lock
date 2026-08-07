@@ -5,7 +5,7 @@ version = 4
 [[package]]
 name = "adelie-telemetry"
 version = "0.1.0"
-source = "git+https://github.com/adelie-ai/adelie-telemetry?rev=1b8166ab483174e76aa23079858b8a31aaa52ae1#1b8166ab483174e76aa23079858b8a31aaa52ae1"
+source = "git+https://github.com/adelie-ai/adelie-telemetry?rev=5c762eca14e43295dd27c5d5adaa658924f5f133#5c762eca14e43295dd27c5d5adaa658924f5f133"
 dependencies = [
  "opentelemetry",
  "opentelemetry-appender-tracing",

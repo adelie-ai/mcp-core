@@ -181,7 +181,7 @@ pub async fn serve_unix(core: Arc<ServerCore>, path: &str) -> Result<()> {
                 // like any other value a caller reaches.
                 tracing::error!(
                     transport = "unix",
-                    error = %crate::server::Safe::message(&e.to_string()),
+                    error = %crate::telemetry::Safe::message(&e),
                     "connection failed"
                 );
             }
