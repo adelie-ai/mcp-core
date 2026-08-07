@@ -11,6 +11,7 @@
 //! the numbers became.
 
 use mcp_core::telemetry::Safe;
+use mcp_core::{Error, TransportError};
 
 /// What replaces a character that could change what a reader sees.
 const REPLACEMENT: char = '\u{fffd}';
@@ -193,6 +194,31 @@ fn a_json_value_is_capped_like_any_other_message() {
 
     assert_eq!(rendered.len(), MAX_MESSAGE_BYTES + TRUNCATED.len());
     assert!(rendered.ends_with(TRUNCATED));
+}
+
+/// AC: an error goes through the wrapper as itself, not as a string it was
+/// rendered to first.
+///
+/// This is the shape the unix transport uses on a failed connection. A framing
+/// error quotes what the peer sent, so the value is a caller's, and a nested
+/// `thiserror` `Display` writes it in several pieces.
+#[test]
+fn an_error_is_sanitised_like_any_other_value() {
+    let peer_sent = format!("a{}b{}", '\u{202e}', "c".repeat(4096));
+    let error = Error::Transport(TransportError::InvalidMessage(peer_sent));
+
+    let rendered = Safe::message(&error).to_string();
+
+    assert!(
+        !rendered.contains('\u{202e}'),
+        "an error carried a bidi control into a log field: {rendered:?}"
+    );
+    assert!(
+        rendered.contains(REPLACEMENT),
+        "the bidi control must be replaced, not dropped: {rendered:?}"
+    );
+    assert_eq!(rendered.len(), MAX_MESSAGE_BYTES + TRUNCATED.len());
+    assert_eq!(rendered, Safe::message(error.to_string()).to_string());
 }
 
 /// Rendering a value through the wrapper must equal rendering it to a string
