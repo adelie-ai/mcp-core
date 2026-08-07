@@ -27,13 +27,107 @@ const METHOD_OTHER: &str = "other";
 /// The `request_id` span field used for a notification, which has no id.
 const NO_REQUEST_ID: &str = "-";
 
+/// The most bytes of a caller-chosen name a log field keeps.
+///
+/// The same limit the metrics facade puts on a label value, so one name reads
+/// the same way whichever signal an operator looks at.
+const MAX_NAME_BYTES: usize = 128;
+
+/// The most bytes of a diagnostic message a log field keeps.
+///
+/// Wider than a name, because the text is mostly what this crate or the server
+/// wrote and is worth keeping whole.
+const MAX_MESSAGE_BYTES: usize = 1024;
+
+/// What replaces a character that could end a log line.
+const REPLACEMENT: char = '\u{fffd}';
+
+/// What marks a value the cap cut short.
+const TRUNCATED: &str = "...";
+
+/// A value a caller can influence, rendered safely into a log field.
+///
+/// Two things make a raw value unsafe here. The console layer writes a field
+/// value straight into a line, so a newline in one produces what reads as a
+/// second genuine line, with a real timestamp column, level and target; and an
+/// ANSI escape survives, because turning the formatter's own colour off does
+/// not strip an escape carried inside a value. Control characters are replaced
+/// rather than dropped, so the field still shows that something was there.
+///
+/// Length is the second problem. Nothing bounds a method name, a tool name or
+/// a request id short of the transport's frame cap, which is measured in
+/// megabytes, and with the `otel` feature on a span field leaves the process
+/// verbatim. One request could otherwise ship as much as it liked.
+///
+/// This wraps what a *caller* reaches. It does not wrap the socket path or the
+/// listen address, which come from the operator's own command line and are
+/// written once at startup.
+pub(crate) struct Safe<'a> {
+    value: &'a str,
+    cap: usize,
+}
+
+impl<'a> Safe<'a> {
+    /// A name the caller chose: a method, a tool, a request id. Short by
+    /// nature, so the tight cap costs nothing real.
+    pub(crate) fn name(value: &'a str) -> Self {
+        Self {
+            value,
+            cap: MAX_NAME_BYTES,
+        }
+    }
+
+    /// A diagnostic message. Mostly text this crate or the server wrote, but a
+    /// server routinely quotes the caller's own input back inside it.
+    pub(crate) fn message(value: &'a str) -> Self {
+        Self {
+            value,
+            cap: MAX_MESSAGE_BYTES,
+        }
+    }
+}
+
+impl std::fmt::Display for Safe<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::fmt::Write;
+
+        let mut written = 0;
+        for character in self.value.chars() {
+            let safe = if is_line_breaking(character) {
+                REPLACEMENT
+            } else {
+                character
+            };
+            let length = safe.len_utf8();
+            if written + length > self.cap {
+                return f.write_str(TRUNCATED);
+            }
+            f.write_char(safe)?;
+            written += length;
+        }
+        Ok(())
+    }
+}
+
+/// Whether this character could end a log line or move a cursor.
+///
+/// `char::is_control` covers C0, C1 and DEL. It does not cover U+2028 LINE
+/// SEPARATOR or U+2029 PARAGRAPH SEPARATOR, which are categories Zl and Zp and
+/// which some log viewers, and every JSON consumer, treat as a line break.
+fn is_line_breaking(character: char) -> bool {
+    character.is_control() || character == '\u{2028}' || character == '\u{2029}'
+}
+
 /// A JSON-RPC id as a span field, rendered only if a subscriber asks for it.
 struct RequestId<'a>(Option<&'a Value>);
 
 impl std::fmt::Display for RequestId<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.0 {
-            Some(id) => write!(f, "{id}"),
+            // A JSON rendering escapes a control character on its own. The cap
+            // is what [`Safe`] adds here, because a caller sets the id and
+            // nothing else bounds how long it is.
+            Some(id) => write!(f, "{}", Safe::name(&id.to_string())),
             None => f.write_str(NO_REQUEST_ID),
         }
     }
@@ -123,7 +217,7 @@ impl Session {
             // and ids, so they belong at INFO. The params never join them.
             tracing::info_span!(
                 "mcp.request",
-                method = %method,
+                method = %Safe::name(method),
                 request_id = %RequestId(message.get("id")),
                 transport = %self.transport,
             )
@@ -295,7 +389,7 @@ impl Session {
         // The tool name is a name, so it belongs at INFO and on the span. The
         // arguments are content — file paths, command lines, search text — so
         // D10 keeps them off both, and puts them on a DEBUG line instead.
-        let span = tracing::info_span!("mcp.tools.call", tool = %name);
+        let span = tracing::info_span!("mcp.tools.call", tool = %Safe::name(name));
         async move {
             tracing::debug!(arguments = %arguments, "tool call arguments");
             let started = Instant::now();
@@ -339,12 +433,15 @@ impl Session {
                 // A tool that declines is a normal outcome, not a fault, so it
                 // is reported at DEBUG. Its message can quote the arguments,
                 // which is the other reason it cannot go higher.
+                // A server routinely quotes the caller's own tool name or
+                // arguments back in the message, so it is wrapped like any
+                // other caller-supplied value.
                 Err(CallError::Tool(msg) | CallError::InvalidParams(msg)) => {
-                    tracing::debug!(reason = %msg, "tool returned an error result");
+                    tracing::debug!(reason = %Safe::message(&msg), "tool returned an error result");
                     Outcome::Result(tool_error_result(&msg))
                 }
                 Err(CallError::Internal(msg)) => {
-                    tracing::error!(error = %msg, "tool call failed");
+                    tracing::error!(error = %Safe::message(&msg), "tool call failed");
                     Outcome::Error(code::INTERNAL_ERROR, msg)
                 }
             }

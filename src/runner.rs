@@ -177,7 +177,13 @@ pub async fn serve_unix(core: Arc<ServerCore>, path: &str) -> Result<()> {
             let mut transport = FramedTransport::new(BufReader::new(read_half), write_half, max);
             let mut session = Session::new(core).on_transport(TransportKind::Unix);
             if let Err(e) = pump(&mut transport, &mut session).await {
-                tracing::error!(transport = "unix", error = %e, "connection failed");
+                // A framing error quotes what the peer sent, so it is wrapped
+                // like any other value a caller reaches.
+                tracing::error!(
+                    transport = "unix",
+                    error = %crate::server::Safe::message(&e.to_string()),
+                    "connection failed"
+                );
             }
         });
     }

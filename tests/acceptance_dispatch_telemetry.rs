@@ -213,6 +213,80 @@ fn tools_call_span_does_not_record_arguments() {
     );
 }
 
+/// A caller chooses the method name, the tool name and the request id. None of
+/// them may end a log line, drive a terminal, or grow without a bound.
+///
+/// The console layer writes a field value straight into a line, so a newline in
+/// one produces what reads as a second genuine line, with a real timestamp
+/// column, level and target. `with_ansi(false)` turns off the formatter's own
+/// colour, not an escape carried inside a value. With `otel` on the same value
+/// leaves the process as a span attribute.
+#[test]
+fn caller_supplied_names_cannot_forge_a_log_line() {
+    let forged = "x\n2026-08-07T00:00:00.000000Z  INFO mcp_core: authentication disabled\u{1b}[31m";
+    let long = "l".repeat(4096);
+
+    let recorded = capture_dispatch(&[
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {"name": forged, "arguments": {}},
+        }),
+        json!({"jsonrpc": "2.0", "id": forged, "method": forged, "params": {}}),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {"name": long, "arguments": {}},
+        }),
+    ]);
+
+    // No field anywhere may break a line. That covers the span fields and the
+    // event fields alike, because both are written into the console stream.
+    let everything = recorded
+        .spans
+        .iter()
+        .flat_map(|span| {
+            span.fields
+                .iter()
+                .map(move |(key, value)| (span.name, key, value))
+        })
+        .chain(recorded.events.iter().flat_map(|event| {
+            event
+                .fields
+                .iter()
+                .map(|(key, value)| ("<event>", key, value))
+        }));
+
+    for (owner, key, value) in everything {
+        assert!(
+            !value
+                .chars()
+                .any(|c| c.is_control() || c == '\u{2028}' || c == '\u{2029}'),
+            "{owner} field {key:?} carries a character that can end a log line or drive a \
+             terminal: {value:?}"
+        );
+    }
+
+    // A span field is capped as well. It is exported verbatim with `otel` on,
+    // and the transport cap is measured in megabytes, so an uncapped one lets
+    // one request ship as much as it likes. The DEBUG arguments line is
+    // deliberately not capped: an operator who raises the level wants the whole
+    // value.
+    for span in &recorded.spans {
+        for (key, value) in &span.fields {
+            assert!(
+                value.len() <= 256,
+                "span {:?} field {key:?} is unbounded at {} bytes; a caller sets it",
+                span.name,
+                value.len()
+            );
+        }
+    }
+}
+
 /// AC: no `eprintln!` remains in `src/runner.rs`; its diagnostics carry
 /// structured fields instead.
 #[test]
@@ -233,8 +307,12 @@ fn runner_diagnostics_use_structured_fields() {
         "src/runner.rs must report lifecycle at INFO and failures at ERROR"
     );
     assert!(
-        RUNNER.contains("error = %e"),
+        RUNNER.contains("error = %"),
         "a failure must carry the cause as a structured field, not an interpolated string"
+    );
+    assert!(
+        !RUNNER.contains("connection error: {"),
+        "a diagnostic must not interpolate its cause into the message text"
     );
 }
 

@@ -113,11 +113,14 @@ impl McpService for Demo {
 
     async fn call_tool(&self, name: &str, args: &Value) -> Result<ToolReply, CallError> {
         match name {
+            "echo" | "metrics_probe" => Ok(ToolReply::text(args.to_string())),
             "boom" => Err(CallError::internal("the demo tool was told to fail")),
             "bad" => Err(CallError::invalid_params(
                 "the demo tool wanted other arguments",
             )),
-            _ => Ok(ToolReply::text(args.to_string())),
+            // Real servers quote the name back, which is how a caller-supplied
+            // string reaches the error field the dispatcher logs.
+            other => Err(CallError::tool(format!("unknown tool: {other}"))),
         }
     }
 }
