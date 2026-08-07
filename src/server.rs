@@ -27,6 +27,18 @@ const METHOD_OTHER: &str = "other";
 /// The `request_id` span field used for a notification, which has no id.
 const NO_REQUEST_ID: &str = "-";
 
+/// A JSON-RPC id as a span field, rendered only if a subscriber asks for it.
+struct RequestId<'a>(Option<&'a Value>);
+
+impl std::fmt::Display for RequestId<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(id) => write!(f, "{id}"),
+            None => f.write_str(NO_REQUEST_ID),
+        }
+    }
+}
+
 /// Immutable, shared server state: the config and the service implementation.
 /// Cheap to clone (it's behind an `Arc`); one is shared by every connection.
 pub struct ServerCore {
@@ -99,23 +111,23 @@ impl Session {
     /// Handle one parsed JSON-RPC message and produce the response (if any) and
     /// any notifications to flush.
     pub async fn handle_message(&mut self, message: Value) -> Dispatch {
-        let method = message
-            .get("method")
-            .and_then(Value::as_str)
-            .unwrap_or(METHOD_INVALID)
-            .to_string();
-        let request_id = message
-            .get("id")
-            .map_or_else(|| NO_REQUEST_ID.to_string(), Value::to_string);
-
-        // D10: the method name, the request id and the transport are names and
-        // ids, so they belong at INFO. The params never join them.
-        let span = tracing::info_span!(
-            "mcp.request",
-            method = %method,
-            request_id = %request_id,
-            transport = %self.transport,
-        );
+        // The borrows end with the span, so nothing here allocates. A field is
+        // rendered only if a subscriber asks for it, and a server with logging
+        // off must not pay for a string it will never print.
+        let span = {
+            let method = message
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or(METHOD_INVALID);
+            // D10: the method name, the request id and the transport are names
+            // and ids, so they belong at INFO. The params never join them.
+            tracing::info_span!(
+                "mcp.request",
+                method = %method,
+                request_id = %RequestId(message.get("id")),
+                transport = %self.transport,
+            )
+        };
         self.dispatch(message).instrument(span).await
     }
 
