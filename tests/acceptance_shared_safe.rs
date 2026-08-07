@@ -199,7 +199,10 @@ fn a_json_value_is_capped_like_any_other_message() {
 /// first and wrapping that.
 ///
 /// This is what makes the piecewise `Display` of a JSON value safe: the cap and
-/// the substitution see one stream, not one call per piece.
+/// the substitution see one stream, not one call per piece. Both caps are
+/// checked, because the dispatch path uses each of them on a JSON value - the
+/// name cap on a request id, the message cap on the arguments payload - and
+/// the tighter cap is where the two ways of rendering would first diverge.
 #[test]
 fn wrapping_a_value_equals_wrapping_its_own_rendering() {
     let cases = [
@@ -207,13 +210,24 @@ fn wrapping_a_value_equals_wrapping_its_own_rendering() {
         serde_json::json!({ "bulk": "b".repeat(4096) }),
         serde_json::json!([1, 2, 3]),
         serde_json::json!(null),
+        serde_json::json!("a-request-id"),
+        serde_json::json!(format!("id-{}-{}", '\u{2028}', "x".repeat(200))),
+        serde_json::json!("x".repeat(MAX_NAME_BYTES)),
+        serde_json::json!(7),
     ];
 
     for value in cases {
         assert_eq!(
+            Safe::name(&value).to_string(),
+            Safe::name(value.to_string()).to_string(),
+            "the piecewise rendering of {value} disagreed with its whole rendering, at the \
+             name cap"
+        );
+        assert_eq!(
             Safe::message(&value).to_string(),
             Safe::message(value.to_string()).to_string(),
-            "the piecewise rendering of {value} disagreed with its whole rendering"
+            "the piecewise rendering of {value} disagreed with its whole rendering, at the \
+             message cap"
         );
     }
 }
