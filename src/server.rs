@@ -20,8 +20,8 @@ const METHOD_INVALID: &str = "invalid";
 ///
 /// A caller chooses the method name, so labelling the counter with it verbatim
 /// would let a probing client fill the registry's cardinality budget and push
-/// the real methods into the overflow series. The name still reaches the span,
-/// where there is no budget to spend.
+/// the real methods into the overflow series. The name itself still reaches the
+/// span, which costs no series, bounded there by [`Safe`] instead.
 const METHOD_OTHER: &str = "other";
 
 /// The `request_id` span field used for a notification, which has no id.
