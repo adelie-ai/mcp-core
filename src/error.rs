@@ -23,6 +23,10 @@ pub enum Error {
     /// Invalid runtime configuration (e.g. a transport the server disabled).
     #[error("configuration error: {0}")]
     Config(String),
+
+    /// The process subscriber could not be installed.
+    #[error("telemetry error: {0}")]
+    Telemetry(#[from] adelie_telemetry::Error),
 }
 
 /// Transport-level framing and connection errors.

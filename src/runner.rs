@@ -58,7 +58,7 @@ pub async fn serve(core: Arc<ServerCore>, common: &CommonServeArgs) -> Result<()
 pub async fn serve_stdio(core: Arc<ServerCore>) -> Result<()> {
     let max = core.config().max_content_length;
     let mut transport = FramedTransport::stdio(max);
-    let mut session = Session::new(core);
+    let mut session = Session::new(core).on_transport(TransportKind::Stdio);
     pump(&mut transport, &mut session).await
 }
 
@@ -167,7 +167,7 @@ pub async fn serve_unix(core: Arc<ServerCore>, path: &str) -> Result<()> {
     prepare_unix_socket_path(path)?;
     let listener = UnixListener::bind(path)?;
     restrict_socket_perms(path)?;
-    eprintln!("mcp-core: listening on unix socket {path}");
+    tracing::info!(transport = "unix", %path, "listening");
     loop {
         let (stream, _addr) = listener.accept().await?;
         let core = Arc::clone(&core);
@@ -175,9 +175,15 @@ pub async fn serve_unix(core: Arc<ServerCore>, path: &str) -> Result<()> {
         tokio::spawn(async move {
             let (read_half, write_half) = stream.into_split();
             let mut transport = FramedTransport::new(BufReader::new(read_half), write_half, max);
-            let mut session = Session::new(core);
+            let mut session = Session::new(core).on_transport(TransportKind::Unix);
             if let Err(e) = pump(&mut transport, &mut session).await {
-                eprintln!("mcp-core: unix connection error: {e}");
+                // A framing error quotes what the peer sent, so it is wrapped
+                // like any other value a caller reaches.
+                tracing::error!(
+                    transport = "unix",
+                    error = %crate::server::Safe::message(&e.to_string()),
+                    "connection failed"
+                );
             }
         });
     }
@@ -220,7 +226,10 @@ pub async fn serve_websocket(core: Arc<ServerCore>, host: &str, port: u16) -> Re
             .await?,
         );
         if auth.is_enabled() {
-            eprintln!("mcp-core: websocket Bearer-token authentication enabled");
+            tracing::info!(
+                transport = "websocket",
+                "bearer-token authentication enabled"
+            );
         }
         WsState {
             core: Arc::clone(&core),
@@ -237,7 +246,7 @@ pub async fn serve_websocket(core: Arc<ServerCore>, host: &str, port: u16) -> Re
         .with_state(state);
     let addr = format!("{host}:{port}");
     let listener = TcpListener::bind(&addr).await?;
-    eprintln!("mcp-core: websocket listening on ws://{addr}/ws");
+    tracing::info!(transport = "websocket", %addr, path = "/ws", "listening");
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -278,7 +287,7 @@ async fn ws_connection(socket: axum::extract::ws::WebSocket, core: Arc<ServerCor
     use futures_util::{SinkExt, StreamExt};
 
     let (mut sender, mut receiver) = socket.split();
-    let mut session = Session::new(core);
+    let mut session = Session::new(core).on_transport(TransportKind::Websocket);
 
     while let Some(msg) = receiver.next().await {
         let text = match msg {
@@ -323,6 +332,18 @@ async fn ws_connection(socket: axum::extract::ws::WebSocket, core: Arc<ServerCor
 /// the server's args to `build` to construct the service, then serves. Use the
 /// lower-level [`serve`] + [`ServerCore`] directly if you need extra
 /// subcommands.
+///
+/// # Telemetry
+///
+/// This is the one place in the crate that installs the process subscriber.
+/// It owns the process, so it is the only place that may: a library path that
+/// installed one would fight the subscriber of whatever binary hosts it. A
+/// server that takes the lower-level [`serve`] instead owns that job itself,
+/// through [`crate::telemetry::init`].
+///
+/// Logs go to stderr, at `info` unless `RUST_LOG` says otherwise. The `otel`
+/// feature adds OTLP export beside them, configured from the standard `OTEL_*`
+/// environment variables.
 pub async fn run<L, S, Build, Fut>(config: crate::config::ServerConfig, build: Build) -> Result<()>
 where
     L: clap::Args,
@@ -359,6 +380,12 @@ where
         command: Cmd::Serve { common, local },
     } = Cli::<L>::from_arg_matches(&matches)
         .map_err(|e| Error::Config(format!("argument parsing: {e}")))?;
+
+    // After argument parsing, so `--help` and `--version` install nothing, and
+    // before the service is built, so a failure there is reported. The guard
+    // lives for the rest of `run`; dropping it flushes the exporters, and a
+    // process that exits without that loses whatever they had buffered.
+    let _telemetry = crate::telemetry::init(crate::telemetry::Config::new(config.name.clone()))?;
 
     let service = build(local).await?;
     let core = ServerCore::new(config, Arc::new(service));

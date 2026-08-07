@@ -3,7 +3,7 @@ name = "mcp-core"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-description = "Shared core for the adelie-ai hand-rolled MCP servers: JSON-RPC 2.0 protocol/dispatch, stdio/websocket/unix transports, and a standard Clap CLI with a per-server extension hook."
+description = "Shared core for the adelie-ai hand-rolled MCP servers: JSON-RPC 2.0 protocol/dispatch, stdio/websocket/unix transports, a standard Clap CLI with a per-server extension hook, and the process telemetry subscriber that its runner installs."
 repository = "https://github.com/adelie-ai/mcp-core"
 
 [dependencies]
@@ -32,10 +32,22 @@ jsonwebtoken = { version = "10", default-features = false, features = [
 ], optional = true }
 jwtk = { version = "0.5", optional = true }
 reqwest = { version = "0.13", features = ["json"], optional = true }
+# Telemetry: the subscriber `run` installs, the metrics facade this crate
+# records through, and the trace-context helpers. Not optional — a default
+# build of it resolves no opentelemetry crate, so a stdio-only server pays
+# nothing for it. The `otel` feature below is what turns export on.
+adelie-telemetry = { git = "https://github.com/adelie-ai/adelie-telemetry", rev = "1b8166ab483174e76aa23079858b8a31aaa52ae1" }
+# Spans and events on the dispatch path. Already in the tree through
+# adelie-telemetry, so naming it directly adds no crate.
+tracing = "0.1.44"
 
 [dev-dependencies]
 # `time` is only needed by tests (timeouts around reads that must terminate).
 tokio = { version = "1.48", features = ["time"] }
+# A capturing `Layer` for the span and level-contract tests: they have to read
+# back the spans and events the dispatch path really produced. Already in the
+# tree through adelie-telemetry, so this adds no crate.
+tracing-subscriber = "0.3.23"
 
 [features]
 # Stdio + unix are free (no extra crates), so they're on by default. The
@@ -50,6 +62,12 @@ auth = ["websocket", "dep:jsonwebtoken", "dep:jwtk", "dep:reqwest"]
 # Unix-domain-socket transport. Uses tokio's net (already a dependency), so this
 # feature only gates the code, not extra crates.
 unix = []
+# OTLP export of traces, metrics and log records. A passthrough to
+# adelie-telemetry, off by default: with it off no opentelemetry crate is
+# resolved at all, and console logging plus the in-process metrics summary work
+# unchanged. A server turns it on with its own `otel = ["mcp-core/otel"]`, and
+# configures it with the standard `OTEL_*` environment variables.
+otel = ["adelie-telemetry/otel"]
 
 [lints.rust]
 warnings = "deny"

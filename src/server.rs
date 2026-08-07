@@ -1,12 +1,174 @@
 //! Protocol core: per-connection [`Session`] dispatch and shared [`ServerCore`].
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde_json::{Value, json};
+use tracing::Instrument;
 
-use crate::config::ServerConfig;
+use crate::config::{ServerConfig, TransportKind};
 use crate::error::code;
 use crate::service::{CallError, McpService};
+use crate::telemetry::metrics::{self, Label};
+
+/// The `method` label used for a payload that never named a method: a batch
+/// array, a scalar, a wrong `jsonrpc` version, or a request with no `method`
+/// member.
+const METHOD_INVALID: &str = "invalid";
+
+/// The `method` label used for a method this server does not implement.
+///
+/// A caller chooses the method name, so labelling the counter with it verbatim
+/// would let a probing client fill the registry's cardinality budget and push
+/// the real methods into the overflow series. The name itself still reaches the
+/// span, which costs no series, bounded there by [`Safe`] instead.
+const METHOD_OTHER: &str = "other";
+
+/// The `request_id` span field used for a notification, which has no id.
+const NO_REQUEST_ID: &str = "-";
+
+/// The most bytes of a caller-chosen name a log field keeps.
+///
+/// The same limit the metrics facade puts on a label value, so one name reads
+/// the same way whichever signal an operator looks at.
+const MAX_NAME_BYTES: usize = 128;
+
+/// The most bytes of a diagnostic message a log field keeps.
+///
+/// Wider than a name, because the text is mostly what this crate or the server
+/// wrote and is worth keeping whole.
+const MAX_MESSAGE_BYTES: usize = 1024;
+
+/// What replaces a character that could end a log line.
+const REPLACEMENT: char = '\u{fffd}';
+
+/// What marks a value the cap cut short.
+const TRUNCATED: &str = "...";
+
+/// A value a caller can influence, rendered safely into a log field.
+///
+/// Two things make a raw value unsafe here. The console layer writes a field
+/// value straight into a line, so a newline in one produces what reads as a
+/// second genuine line, with a real timestamp column, level and target; and an
+/// ANSI escape survives, because turning the formatter's own colour off does
+/// not strip an escape carried inside a value. Control characters are replaced
+/// rather than dropped, so the field still shows that something was there.
+///
+/// Length is the second problem. Nothing bounds a method name, a tool name or
+/// a request id short of the transport's frame cap, which is measured in
+/// megabytes, and with the `otel` feature on a span field leaves the process
+/// verbatim. One request could otherwise ship as much as it liked.
+///
+/// This wraps what a *caller* reaches. It does not wrap the socket path or the
+/// listen address, which come from the operator's own command line and are
+/// written once at startup.
+pub(crate) struct Safe<'a> {
+    value: &'a str,
+    cap: usize,
+}
+
+impl<'a> Safe<'a> {
+    /// A name the caller chose: a method, a tool, a request id. Short by
+    /// nature, so the tight cap costs nothing real.
+    pub(crate) fn name(value: &'a str) -> Self {
+        Self {
+            value,
+            cap: MAX_NAME_BYTES,
+        }
+    }
+
+    /// A diagnostic message. Mostly text this crate or the server wrote, but a
+    /// server routinely quotes the caller's own input back inside it.
+    pub(crate) fn message(value: &'a str) -> Self {
+        Self {
+            value,
+            cap: MAX_MESSAGE_BYTES,
+        }
+    }
+}
+
+impl std::fmt::Display for Safe<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::fmt::Write;
+
+        let mut written = 0;
+        for character in self.value.chars() {
+            let safe = if is_deceptive(character) {
+                REPLACEMENT
+            } else {
+                character
+            };
+            let length = safe.len_utf8();
+            if written + length > self.cap {
+                return f.write_str(TRUNCATED);
+            }
+            f.write_char(safe)?;
+            written += length;
+        }
+        Ok(())
+    }
+}
+
+/// Whether this character could make a field render as something other than
+/// what it is.
+///
+/// Three kinds, and each defeats a different reader.
+///
+/// - `char::is_control` covers C0, C1 and DEL. Those end a line or drive a
+///   terminal.
+/// - U+2028 LINE SEPARATOR and U+2029 PARAGRAPH SEPARATOR are categories Zl
+///   and Zp. `is_control` does not cover them, and some log viewers, and every
+///   JSON consumer, treat them as a line break.
+/// - The bidi controls leave the bytes alone and reverse what a person sees,
+///   so a name renders as something it is not. This is the trojan-source
+///   class, and the set is the one rustc's own
+///   `text_direction_codepoint_in_literal` lint covers.
+///
+/// The wider Cf category is deliberately not swept. A zero-width joiner is Cf
+/// and carries the emoji sequences a person does want to read, and hiding text
+/// is a weaker problem than reversing it.
+fn is_deceptive(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{2028}'
+                | '\u{2029}'
+                | '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
+}
+
+/// A JSON value as a log field, rendered only if a subscriber asks for it.
+///
+/// A JSON rendering escapes the C0 controls on its own, which is what made
+/// this path look safe. It does not escape U+2028, U+2029 or a bidi control,
+/// and it bounds nothing, so it goes through [`Safe`] like any other value a
+/// caller reaches.
+struct SafeJson<'a>(&'a Value);
+
+impl std::fmt::Display for SafeJson<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", Safe::message(&self.0.to_string()))
+    }
+}
+
+/// A JSON-RPC id as a span field, rendered only if a subscriber asks for it.
+struct RequestId<'a>(Option<&'a Value>);
+
+impl std::fmt::Display for RequestId<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            // A JSON rendering escapes a control character on its own. The cap
+            // is what [`Safe`] adds here, because a caller sets the id and
+            // nothing else bounds how long it is.
+            Some(id) => write!(f, "{}", Safe::name(&id.to_string())),
+            None => f.write_str(NO_REQUEST_ID),
+        }
+    }
+}
 
 /// Immutable, shared server state: the config and the service implementation.
 /// Cheap to clone (it's behind an `Arc`); one is shared by every connection.
@@ -43,6 +205,7 @@ pub struct Dispatch {
 pub struct Session {
     core: Arc<ServerCore>,
     initialized: bool,
+    transport: TransportKind,
 }
 
 enum Outcome {
@@ -55,17 +218,63 @@ enum Outcome {
 }
 
 impl Session {
-    /// Start a fresh session bound to the shared core.
+    /// Start a fresh session bound to the shared core, served over stdio.
+    /// Use [`Self::on_transport`] for a session on another transport.
     pub fn new(core: Arc<ServerCore>) -> Self {
         Self {
             core,
             initialized: false,
+            transport: TransportKind::Stdio,
         }
+    }
+
+    /// Record which transport this session arrived on.
+    ///
+    /// The value reaches every request span, so a failing request can be told
+    /// apart from one that came through a different door. It changes nothing
+    /// about how the session behaves.
+    #[must_use]
+    pub fn on_transport(mut self, transport: TransportKind) -> Self {
+        self.transport = transport;
+        self
     }
 
     /// Handle one parsed JSON-RPC message and produce the response (if any) and
     /// any notifications to flush.
     pub async fn handle_message(&mut self, message: Value) -> Dispatch {
+        // The borrows end with the span, so nothing here allocates. A field is
+        // rendered only if a subscriber asks for it, and a server with logging
+        // off must not pay for a string it will never print.
+        let span = {
+            let method = message
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or(METHOD_INVALID);
+            // D10: the method name, the request id and the transport are names
+            // and ids, so they belong at INFO. The params never join them.
+            tracing::info_span!(
+                "mcp.request",
+                method = %Safe::name(method),
+                request_id = %RequestId(message.get("id")),
+                transport = %self.transport,
+            )
+        };
+        self.dispatch(message).instrument(span).await
+    }
+
+    /// Route one message and record what it cost.
+    async fn dispatch(&mut self, message: Value) -> Dispatch {
+        let started = Instant::now();
+        let (dispatch, method) = self.route(message).await;
+        let labels = [Label::new("method", method)];
+        metrics::increment("mcp.requests", &labels);
+        metrics::record_duration("mcp.request.duration", started.elapsed(), &labels);
+        dispatch
+    }
+
+    /// Handle one parsed JSON-RPC message, and report the `method` label its
+    /// counters belong under.
+    async fn route(&mut self, message: Value) -> (Dispatch, String) {
         // MC-5: a JSON-RPC payload must be a single Request/Notification object.
         // An array (batch) or any non-object scalar is not a valid Request —
         // batching was removed from the spec in 2025-06-18 and every version we
@@ -79,14 +288,17 @@ impl Session {
             } else {
                 "request must be a JSON object"
             };
-            return Dispatch {
-                response: Some(error_response(
-                    Some(Value::Null),
-                    code::INVALID_REQUEST,
-                    msg,
-                )),
-                notifications: Vec::new(),
-            };
+            return (
+                Dispatch {
+                    response: Some(error_response(
+                        Some(Value::Null),
+                        code::INVALID_REQUEST,
+                        msg,
+                    )),
+                    notifications: Vec::new(),
+                },
+                METHOD_INVALID.to_string(),
+            );
         }
 
         let id = message.get("id").cloned();
@@ -97,20 +309,26 @@ impl Session {
         if let Some(version) = message.get("jsonrpc").and_then(Value::as_str)
             && version != "2.0"
         {
-            return Self::finish(
-                is_request,
-                id,
-                Outcome::Error(
-                    code::INVALID_REQUEST,
-                    format!("invalid jsonrpc version: {version}"),
+            return (
+                Self::finish(
+                    is_request,
+                    id,
+                    Outcome::Error(
+                        code::INVALID_REQUEST,
+                        format!("invalid jsonrpc version: {version}"),
+                    ),
+                    Vec::new(),
                 ),
-                Vec::new(),
+                METHOD_INVALID.to_string(),
             );
         }
 
         let method = message.get("method").and_then(Value::as_str);
         let params = message.get("params").cloned().unwrap_or(Value::Null);
         let mut notifications = Vec::new();
+        // A method this server does not implement is a name the caller chose,
+        // so it is counted under `other` rather than under itself.
+        let mut method_label = method.unwrap_or(METHOD_INVALID).to_string();
 
         let outcome = match method {
             Some("initialize") => Outcome::Result(self.handle_initialize(&params)),
@@ -135,12 +353,19 @@ impl Session {
                 Outcome::Result(Value::Null)
             }
             Some(other) => {
+                method_label = METHOD_OTHER.to_string();
                 Outcome::Error(code::METHOD_NOT_FOUND, format!("method not found: {other}"))
             }
-            None => Outcome::Error(code::INVALID_REQUEST, "missing method".into()),
+            None => {
+                method_label = METHOD_INVALID.to_string();
+                Outcome::Error(code::INVALID_REQUEST, "missing method".into())
+            }
         };
 
-        Self::finish(is_request, id, outcome, notifications)
+        (
+            Self::finish(is_request, id, outcome, notifications),
+            method_label,
+        )
     }
 
     fn handle_initialize(&mut self, params: &Value) -> Value {
@@ -198,29 +423,78 @@ impl Session {
         };
         let arguments = params.get("arguments").cloned().unwrap_or(Value::Null);
 
-        match self.core.service.call_tool(name, &arguments).await {
-            Ok(reply) => {
-                if reply.tools_list_changed {
-                    notifications.push(json!({
-                        "jsonrpc": "2.0",
-                        "method": "notifications/tools/list_changed",
-                    }));
+        // The tool name is a name, so it belongs at INFO and on the span. The
+        // arguments are content — file paths, command lines, search text — so
+        // D10 keeps them off both, and puts them on a DEBUG line instead.
+        let span = tracing::info_span!("mcp.tools.call", tool = %Safe::name(name));
+        async move {
+            tracing::debug!(arguments = %SafeJson(&arguments), "tool call arguments");
+            let started = Instant::now();
+            let result = self.core.service.call_tool(name, &arguments).await;
+            let outcome = match &result {
+                Ok(_) => "ok",
+                Err(CallError::Internal(_)) => "error",
+                Err(CallError::Tool(_) | CallError::InvalidParams(_)) => "tool_error",
+            };
+            // The tool name is chosen by the caller, so the registry's
+            // cardinality cap is what bounds this series.
+            metrics::increment(
+                "mcp.tools.call",
+                &[Label::new("tool", name), Label::new("outcome", outcome)],
+            );
+            metrics::record_duration(
+                "mcp.tools.call.duration",
+                started.elapsed(),
+                &[Label::new("tool", name)],
+            );
+
+            match result {
+                Ok(reply) => {
+                    if reply.tools_list_changed {
+                        notifications.push(json!({
+                            "jsonrpc": "2.0",
+                            "method": "notifications/tools/list_changed",
+                        }));
+                    }
+                    Outcome::Result(reply.to_result_json())
                 }
-                Outcome::Result(reply.to_result_json())
+                // Tool failures are a successful response with isError content.
+                //
+                // Why InvalidParams lands here too (SEP-1303): bad arguments are
+                // something the model supplied and can correct, so it has to see
+                // them. A JSON-RPC error is invisible to the model and takes the
+                // turn with it. Only faults the model cannot act on stay protocol
+                // errors — a malformed request (no tool name, above) and an
+                // internal server fault (below).
+                //
+                // A tool that declines is a normal outcome, not a fault, so it
+                // is reported at DEBUG. Its message can quote the arguments,
+                // which is the other reason it cannot go higher.
+                // A server routinely quotes the caller's own tool name or
+                // arguments back in the message, so it is wrapped like any
+                // other caller-supplied value.
+                Err(CallError::Tool(msg) | CallError::InvalidParams(msg)) => {
+                    tracing::debug!(reason = %Safe::message(&msg), "tool returned an error result");
+                    Outcome::Result(tool_error_result(&msg))
+                }
+                // A fault, so the line stays at ERROR: an operator has to see
+                // that a tool broke without raising the level first. The
+                // message does not stay with it. `CallError::internal` is as
+                // free-form as the other two variants, and the idiom a server
+                // reaches for on an unexpected IO fault quotes an argument back
+                // (`failed to read {path}`), which D10 keeps off the INFO band.
+                // The span around this line carries the tool, the method, the
+                // request id and the transport, so the ERROR is still
+                // actionable and still correlated without it.
+                Err(CallError::Internal(msg)) => {
+                    tracing::error!("tool call failed");
+                    tracing::debug!(error = %Safe::message(&msg), "tool call failure detail");
+                    Outcome::Error(code::INTERNAL_ERROR, msg)
+                }
             }
-            // Tool failures are a successful response with isError content.
-            //
-            // Why InvalidParams lands here too (SEP-1303): bad arguments are
-            // something the model supplied and can correct, so it has to see
-            // them. A JSON-RPC error is invisible to the model and takes the
-            // turn with it. Only faults the model cannot act on stay protocol
-            // errors — a malformed request (no tool name, above) and an
-            // internal server fault (below).
-            Err(CallError::Tool(msg) | CallError::InvalidParams(msg)) => {
-                Outcome::Result(tool_error_result(&msg))
-            }
-            Err(CallError::Internal(msg)) => Outcome::Error(code::INTERNAL_ERROR, msg),
         }
+        .instrument(span)
+        .await
     }
 
     fn tools_json(&self) -> Value {
