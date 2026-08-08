@@ -1358,12 +1358,15 @@ dependencies = [
  "futures-util",
  "jsonwebtoken",
  "jwtk",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "reqwest",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-opentelemetry",
  "tracing-subscriber",
 ]
 

@@ -11,6 +11,7 @@ use crate::error::code;
 use crate::service::{CallError, McpService};
 use crate::telemetry::Safe;
 use crate::telemetry::metrics::{self, Label};
+use crate::telemetry::trace_context::{self, TraceParent};
 
 /// The `method` label used for a payload that never named a method: a batch
 /// array, a scalar, a wrong `jsonrpc` version, or a request with no `method`
@@ -116,6 +117,10 @@ impl Session {
     /// Handle one parsed JSON-RPC message and produce the response (if any) and
     /// any notifications to flush.
     pub async fn handle_message(&mut self, message: Value) -> Dispatch {
+        // Read before the span opens, because the parent of a span cannot be
+        // set once the span has been entered.
+        let caller_trace = caller_trace_parent(&message);
+
         // The borrows end with the span, so nothing here allocates. A field is
         // rendered only if a subscriber asks for it, and a server with logging
         // off must not pay for a string it will never print.
@@ -131,8 +136,25 @@ impl Session {
                 method = %Safe::name(method),
                 request_id = %RequestId(message.get("id")),
                 transport = %self.transport,
+                // Filled in below, and only when the caller sent a trace to
+                // join. A request that carried none carries no field either:
+                // an empty or all-zero value reads as a real trace, and an
+                // operator who greps for it finds every request that had none.
+                trace_id = tracing::field::Empty,
             )
         };
+
+        if let Some(parent) = caller_trace {
+            // 32 lowercase hexadecimal characters by construction, so this is
+            // the one value a caller reaches that needs no cap: it is the id
+            // itself. It goes on with `otel` off as well, which is what keeps
+            // a default build correlatable — the caller writes the same id on
+            // its own lines, and one grep then covers both processes.
+            span.record("trace_id", tracing::field::display(parent.trace_id()));
+            #[cfg(feature = "otel")]
+            join_caller_trace(&span, parent);
+        }
+
         self.dispatch(message).instrument(span).await
     }
 
@@ -430,6 +452,70 @@ impl Session {
             response,
             notifications,
         }
+    }
+}
+
+/// The trace context a request carries, if it carries a usable one.
+///
+/// A caller that already has a trace puts its W3C trace context in the request
+/// as `params._meta.traceparent`, which the MCP specification reserves for a
+/// field like this. Reading it is what makes one trace cover a whole turn:
+/// the client, the daemon, and every server the turn reached.
+///
+/// Nothing here can fail the request. The caller chooses the value, so an
+/// absent, non-string or unusable one leaves this server to start its own
+/// trace, and says why at DEBUG.
+fn caller_trace_parent(message: &Value) -> Option<TraceParent> {
+    let header = message
+        .get("params")?
+        .get("_meta")?
+        .get("traceparent")?
+        .as_str()?;
+    match trace_context::extract_traceparent(header) {
+        Ok(parent) => Some(parent),
+        Err(error) => {
+            // The error names the fault and never quotes the header back. The
+            // wrapper is what holds it to that, because the value it was
+            // derived from is one a caller chose.
+            tracing::debug!(
+                error = %Safe::message(&error),
+                "ignoring an unusable traceparent and starting a new trace"
+            );
+            None
+        }
+    }
+}
+
+/// Make the caller's span the parent of `span` in the OpenTelemetry context.
+///
+/// The caller's span lives in another process, so the context is a remote one:
+/// this server never ends it and never reports its timing. What it gets is the
+/// trace id and the parent span id, which is what a backend needs to render
+/// the turn as one trace rather than as one trace per process.
+#[cfg(feature = "otel")]
+fn join_caller_trace(span: &tracing::Span, parent: TraceParent) {
+    use opentelemetry::trace::{SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId};
+    use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+    let flags = if parent.sampled() {
+        TraceFlags::SAMPLED
+    } else {
+        TraceFlags::NOT_SAMPLED
+    };
+    let context = opentelemetry::Context::new().with_remote_span_context(SpanContext::new(
+        TraceId::from_bytes(parent.trace_id().to_bytes()),
+        SpanId::from_bytes(parent.span_id().to_bytes()),
+        flags,
+        true,
+        Default::default(),
+    ));
+
+    if let Err(error) = span.set_parent(context) {
+        // Ordinary for a build whose OTLP pipelines did not start: there is
+        // then no OpenTelemetry layer to hold a parent at all. The `trace_id`
+        // field still correlates the two processes, so this costs the span
+        // graph and nothing else.
+        tracing::debug!(%error, "the request span could not join the caller's trace");
     }
 }
 

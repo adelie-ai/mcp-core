@@ -88,13 +88,32 @@ where
 /// Drive `messages` through one session over the demo service, capturing what
 /// the dispatch path emitted.
 pub fn capture_dispatch(messages: &[Value]) -> Recorded {
+    capture_dispatch_replies(messages).0
+}
+
+/// The same, and the responses the session sent back, so a test can hold that a
+/// request was still answered normally.
+pub fn capture_dispatch_replies(messages: &[Value]) -> (Recorded, Vec<Value>) {
     let messages = messages.to_vec();
-    capture(|| async move {
+    let replies = Arc::new(Mutex::new(Vec::new()));
+    let collected = Arc::clone(&replies);
+    let recorded = capture(|| async move {
         let mut session = Session::new(demo_core());
         for message in messages {
-            session.handle_message(message).await;
+            if let Some(response) = session.handle_message(message).await.response {
+                collected
+                    .lock()
+                    .expect("the reply lock is only held to push one response")
+                    .push(response);
+            }
         }
-    })
+    });
+    let replies = std::mem::take(
+        &mut *replies
+            .lock()
+            .expect("the reply lock is only held to push one response"),
+    );
+    (recorded, replies)
 }
 
 /// A service with one ordinary tool and two failure paths, so a test can drive
