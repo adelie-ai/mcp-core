@@ -25,10 +25,12 @@ const CALLER_SPAN_ID: &str = "00f067aa0ba902b7";
 /// The all-zero trace id, which the specification reserves as invalid.
 const NIL_TRACE_ID: &str = "00000000000000000000000000000000";
 
-/// The `_meta` key a caller chose for itself, and the tool argument beside it.
-/// Each carries its own marker, so a leak names which value escaped.
+/// The three values a caller can put where this path reads: a `_meta` key it
+/// chose for itself, the tool argument beside it, and a `traceparent` that is
+/// not a header. Each carries its own marker, so a leak names which one escaped.
 const META_SENTINEL: &str = "/home/someone/private/meta-MARKER-a1b2.txt";
 const ARGUMENT_SENTINEL: &str = "/home/someone/private/args-MARKER-c3d4.txt";
+const TRACEPARENT_SENTINEL: &str = "/home/someone/private/header-MARKER-e5f6.txt";
 
 /// The handshake a session needs before it answers a tool call.
 fn initialize() -> Value {
@@ -142,11 +144,13 @@ fn a_malformed_traceparent_does_not_fail_the_request() {
     );
 }
 
-/// AC: a `traceparent` that is not a string is ignored.
+/// AC: a `traceparent` that is not a string is passed over in silence.
 ///
 /// `_meta` is a caller's own object, so the value under any key there can be
-/// any JSON. None of these is a header, and none of them may fail the request
-/// or reach a span.
+/// any JSON. None of these is a header. None of them may fail the request,
+/// none may reach a span, and none may write a line: the documented contract
+/// says a value of the wrong type costs nothing at all, and a line about every
+/// such request is a cost.
 #[test]
 fn a_non_string_traceparent_is_ignored() {
     for value in [
@@ -178,6 +182,19 @@ fn a_non_string_traceparent_is_ignored() {
             "a traceparent of {value} must leave no trace_id field; the spans were {:?}",
             recorded.span_summary()
         );
+
+        // Silence, at every level. Only a header that parsed and failed earns a
+        // line; a value of the wrong type is not a header at all.
+        for event in &recorded.events {
+            for (key, rendered) in &event.fields {
+                assert!(
+                    !rendered.contains("traceparent"),
+                    "a traceparent of {value} must write no line about itself, but a {} line \
+                     field {key:?} says: {rendered:?}",
+                    event.level
+                );
+            }
+        }
     }
 }
 
@@ -258,6 +275,18 @@ fn traceparent_handling_records_no_caller_content() {
                 },
             },
         }),
+        // The `traceparent` value itself is a caller's, and it is only a header
+        // when it is a string. Anything else is content like any other.
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "echo",
+                "arguments": {"text": "hello"},
+                "_meta": {"traceparent": {"note": TRACEPARENT_SENTINEL}},
+            },
+        }),
     ]);
 
     assert!(
@@ -269,6 +298,7 @@ fn traceparent_handling_records_no_caller_content() {
     for (source, marker) in [
         ("a caller's own _meta key", "MARKER-a1b2"),
         ("a tool argument", "MARKER-c3d4"),
+        ("a traceparent that is not a header", "MARKER-e5f6"),
     ] {
         for span in &recorded.spans {
             for (key, value) in &span.fields {
