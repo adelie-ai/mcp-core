@@ -178,10 +178,14 @@ spans this server exports then join the caller's trace instead of starting one
 of their own.
 
 A caller chooses the value, so a bad one costs the request nothing. A
-`traceparent` that is absent, is not a string, is too long, or is malformed
-leaves the server to start its own trace, and the reason appears at DEBUG. A
-request that carried no usable value carries no `trace_id` field either, because
-an empty one reads as a real trace.
+`traceparent` that is too long or malformed is discarded, and the reason appears
+at DEBUG. One that is absent, or that is not a string, is passed over in
+silence.
+
+Either way the request is answered as usual and carries no `trace_id` field,
+because an empty one reads as a real trace. With `otel` on the server then opens
+a trace of its own, as it does for any request that arrives without one. With
+`otel` off there is no trace to open: the field is simply not there.
 
 Nothing else in `_meta` is read, and nothing else in it reaches a log line.
 

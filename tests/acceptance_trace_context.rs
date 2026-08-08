@@ -142,6 +142,45 @@ fn a_malformed_traceparent_does_not_fail_the_request() {
     );
 }
 
+/// AC: a `traceparent` that is not a string is ignored.
+///
+/// `_meta` is a caller's own object, so the value under any key there can be
+/// any JSON. None of these is a header, and none of them may fail the request
+/// or reach a span.
+#[test]
+fn a_non_string_traceparent_is_ignored() {
+    for value in [
+        json!(1234),
+        json!(null),
+        json!(true),
+        json!({"version": "00"}),
+        json!([CALLER_TRACEPARENT]),
+    ] {
+        let (recorded, replies) = capture_dispatch_replies(&[
+            initialize(),
+            call_with_meta(json!({"traceparent": value.clone()})),
+        ]);
+
+        let reply = replies
+            .iter()
+            .find(|reply| reply.get("id").and_then(Value::as_i64) == Some(2))
+            .unwrap_or_else(|| {
+                panic!(
+                    "the tool call must still be answered for {value}; the replies were {replies:?}"
+                )
+            });
+        assert!(
+            reply.get("error").is_none(),
+            "a traceparent of {value} must not fail the request it arrived on: {reply:?}"
+        );
+        assert!(
+            recorded_trace_ids(&recorded).is_empty(),
+            "a traceparent of {value} must leave no trace_id field; the spans were {:?}",
+            recorded.span_summary()
+        );
+    }
+}
+
 /// AC: a `traceparent` past `MAX_TRACEPARENT_BYTES` is rejected.
 ///
 /// The header arrives inside a client frame, and a frame has no field limit of

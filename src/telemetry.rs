@@ -60,10 +60,12 @@
 //! the request span also takes the caller's span as its parent, so the spans
 //! this server exports join the caller's trace.
 //!
-//! A caller chooses the value, so a bad one costs the request nothing: an
-//! unusable `traceparent` leaves the server to start its own trace and says why
-//! at DEBUG. A request that carried no usable value carries no `trace_id` field
-//! either. Nothing else in `_meta` is read.
+//! A caller chooses the value, so a bad one costs the request nothing: a
+//! `traceparent` that is too long or malformed is discarded, and the reason
+//! goes to DEBUG. One that is absent, or that is not a string, is passed over
+//! in silence. Either way the request is answered as usual and carries no
+//! `trace_id` field: with `otel` on the server opens a trace of its own, and
+//! with `otel` off there is no trace to open. Nothing else in `_meta` is read.
 //!
 //! # Installing the subscriber
 //!
