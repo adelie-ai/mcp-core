@@ -156,6 +156,35 @@ use mcp_core::telemetry::metrics::{self, Label};
 metrics::increment("weather.lookups", &[Label::new("provider", "example")]);
 ```
 
+### Continuing the caller's trace
+
+A caller that already has a trace puts its W3C trace context in the request, as
+`params._meta.traceparent`. The MCP specification reserves `_meta` for a field
+like this one. The server reads it and continues that trace, so one trace
+covers the whole turn: the client, the daemon, and every server the turn
+reached. A server built on this crate does nothing to get it.
+
+It works with `otel` off. The trace id goes on the `mcp.request` span as
+`trace_id`, 32 hexadecimal characters, and the caller writes the same id on its
+own lines. One search then finds the request in both logs, and neither process
+exports anything.
+
+```text
+mcp.request{method=tools/call request_id=3 transport=stdio trace_id=4bf92f3577b34da6a3ce929d0e0e4736}
+```
+
+With `otel` on, the request span also takes the caller's span as its parent. The
+spans this server exports then join the caller's trace instead of starting one
+of their own.
+
+A caller chooses the value, so a bad one costs the request nothing. A
+`traceparent` that is absent, is not a string, is too long, or is malformed
+leaves the server to start its own trace, and the reason appears at DEBUG. A
+request that carried no usable value carries no `trace_id` field either, because
+an empty one reads as a real trace.
+
+Nothing else in `_meta` is read, and nothing else in it reaches a log line.
+
 ### Exporting to a collector
 
 Off by default. A server adds the passthrough to its own manifest, which

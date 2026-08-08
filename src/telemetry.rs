@@ -47,6 +47,24 @@
 //!
 //! [`Safe::name`] caps at 128 bytes and [`Safe::message`] at 1024.
 //!
+//! # Continuing a caller's trace
+//!
+//! A caller that already has a trace puts its W3C trace context in the request
+//! as `params._meta.traceparent`. The dispatch path reads it and continues that
+//! trace, so one trace covers the turn and every server the turn reached. A
+//! server does nothing to get this.
+//!
+//! With `otel` off, the trace id goes on the `mcp.request` span as `trace_id`,
+//! and the caller writes the same id on its own lines, so one search finds the
+//! request in both logs while neither process exports anything. With `otel` on,
+//! the request span also takes the caller's span as its parent, so the spans
+//! this server exports join the caller's trace.
+//!
+//! A caller chooses the value, so a bad one costs the request nothing: an
+//! unusable `traceparent` leaves the server to start its own trace and says why
+//! at DEBUG. A request that carried no usable value carries no `trace_id` field
+//! either. Nothing else in `_meta` is read.
+//!
 //! # Installing the subscriber
 //!
 //! [`crate::run`] already calls [`init`] with the server's own name, so a
