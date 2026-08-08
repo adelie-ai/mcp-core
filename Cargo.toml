@@ -44,6 +44,23 @@ adelie-telemetry = { git = "https://github.com/adelie-ai/adelie-telemetry", rev 
 # Spans and events on the dispatch path. Already in the tree through
 # adelie-telemetry, so naming it directly adds no crate.
 tracing = "0.1.44"
+# Trace-context propagation, and only the export half of it. Reading the
+# caller's `traceparent` and putting its id on the request span needs nothing
+# but adelie-telemetry; these are what make the caller's span the parent of the
+# server's own, so a backend renders one trace over the whole turn. All three
+# are already in the tree through adelie-telemetry with `otel` on, so they add
+# no crate; with `otel` off none of them is resolved.
+#
+# The opentelemetry 0.x crates version-lock as a set, so bump them together and
+# keep them on the set adelie-telemetry resolves. Two versions in one process
+# means two incompatible `SpanContext` types and no parent at all.
+tracing-opentelemetry = { version = "0.33", optional = true }
+opentelemetry = { version = "0.32", optional = true }
+# Only the acceptance test that proves a request span joins the caller's trace
+# reaches this one: it builds a real tracer to read the span context back from.
+# Cargo forbids an optional dev-dependency, so it is declared here and gated by
+# the same feature as the rest.
+opentelemetry_sdk = { version = "0.32", optional = true }
 
 [dev-dependencies]
 # `time` is only needed by tests (timeouts around reads that must terminate).
@@ -71,7 +88,12 @@ unix = []
 # resolved at all, and console logging plus the in-process metrics summary work
 # unchanged. A server turns it on with its own `otel = ["mcp-core/otel"]`, and
 # configures it with the standard `OTEL_*` environment variables.
-otel = ["adelie-telemetry/otel"]
+otel = [
+    "adelie-telemetry/otel",
+    "dep:tracing-opentelemetry",
+    "dep:opentelemetry",
+    "dep:opentelemetry_sdk",
+]
 
 [lints.rust]
 warnings = "deny"
