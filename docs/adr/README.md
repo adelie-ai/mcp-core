@@ -25,3 +25,4 @@ the old constraint existed stays readable.
 | ADR | Title | Status |
 |---|---|---|
 | [0001](0001-mcp-protocol-dialect-seam.md) | The MCP protocol dialect seam | Accepted |
+| [0002](0002-one-jwt-crypto-backend.md) | One JWT crypto backend, `aws_lc_rs` | Accepted |

@@ -31,8 +31,18 @@ axum = { version = "0.8", features = ["ws"], optional = true }
 futures-util = { version = "0.3", optional = true }
 # auth (optional) — websocket Bearer-token validation: HS256 shared secret, or
 # asymmetric JWT via a JWKS document / OIDC discovery.
+#
+# The backend is `aws_lc_rs`, never `rust_crypto` (ADR 0002). `rust_crypto` pulls
+# `rsa`, which carries RUSTSEC-2023-0071 with no fixed release. `aws-lc-rs` is
+# already in the tree through `jwtk`, so this costs no extra crate.
+#
+# Exactly one backend may be enabled. `jsonwebtoken` picks the process-wide
+# provider from its crate features, and with both on it installs one that panics
+# on the first sign or verify. Cargo unions features, so a downstream crate that
+# asks for `rust_crypto` breaks token checks at run time in a build that compiles
+# clean. Every crate here that names `jsonwebtoken` must select `aws_lc_rs`.
 jsonwebtoken = { version = "10", default-features = false, features = [
-    "rust_crypto",
+    "aws_lc_rs",
 ], optional = true }
 jwtk = { version = "0.5", optional = true }
 reqwest = { version = "0.13", features = ["json"], optional = true }
