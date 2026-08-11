@@ -96,9 +96,19 @@ rule the base does not have.
 ### 3.1 The gate for this repo (addition)
 
 The `adelie-ai` repos have no CI, and this repo has no `justfile`. The gate is local and the
-author runs it: `cargo fmt --check`, then `cargo clippy --all-targets -- -D warnings`, then
-`cargo test`. The `[lints]` table denies warnings mechanically as well, so a plain
+author runs it: `cargo audit`, then `cargo fmt --check`, then
+`cargo clippy --all-targets --all-features -- -D warnings`, then `cargo test --all-features`,
+then `cargo test`. The `[lints]` table denies warnings mechanically as well, so a plain
 `cargo build` or `cargo test` also hard-fails on one.
+
+Lint and test with `--all-features` as well as without. `auth`, `websocket` and `otel` are
+optional, so a plain `cargo test` never compiles them. A change inside one of those features
+otherwise passes a gate that never read it.
+
+`cargo audit` runs first, before anything compiles, because build scripts execute at the
+first build. A reported vulnerability blocks the change. Where a finding has no fix, record
+the reason where a reviewer can check it and point at that record from the change. Never
+suppress an advisory silently.
 
 ### 4.3 Branch and pull request - merge when green (override, weaker than the base)
 
